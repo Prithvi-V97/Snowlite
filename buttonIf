@@ -1,5 +1,5 @@
 # =====================================================
-# Approve Selected Records - Full Updated Block
+# Approve Selected Records - Fixed and syntax-correct block
 # =====================================================
 if st.button("Approve Selected Records"):
     to_approve = edited_df[edited_df["approve"] == True]
@@ -9,8 +9,16 @@ if st.button("Approve Selected Records"):
     else:
         approved_count = 0
 
+        # Helper: safely escape SQL string values
+        def sql_quote(v):
+            if v is None:
+                return "NULL"
+            s = str(v)
+            # avoid nested-escaped quotes by using concatenation
+            return "'" + s.replace("'", "''") + "'"
+
         for _, log_row in to_approve.iterrows():
-            # Extract relevant fields
+            # Extract fields
             table_name = log_row.get("table_name")
             new_value = log_row.get("new_value")
             old_value = log_row.get("old_value")
@@ -29,34 +37,24 @@ if st.button("Approve Selected Records"):
                 st.error(f"TEMP table not found for {table_name}")
                 continue
 
-            # Helper: safely escape SQL string values
-            def sql_quote(v):
-                if v is None:
-                    return "NULL"
-                s = str(v)
-                return f"'{s.replace(\"'\", \"''\")}'"
-
             try:
-                # Convert changed_at to a string suitable for SQL
+                # Convert changed_at to string for SQL
                 changed_at_str = None
                 if changed_at is not None:
                     try:
                         changed_at_str = changed_at.isoformat()
                     except Exception:
                         changed_at_str = str(changed_at)
+
                 changed_at_sql = (
                     changed_at_str.replace("'", "''") if changed_at_str else changed_at_str
                 )
 
-                # Build WHERE clause for updating the log record
+                # Build WHERE clause for identifying the log row
                 where_parts = [
-                    f"table_name = '{table_name.replace(\"'\", \"''\")}'",
-                    f"action = '{action.replace(\"'\", \"''\")}'"
-                    if action is not None
-                    else "action IS NULL",
-                    f"changed_by = '{changed_by.replace(\"'\", \"''\")}'"
-                    if changed_by is not None
-                    else "changed_by IS NULL",
+                    "table_name = " + sql_quote(table_name),
+                    ("action = " + sql_quote(action)) if action is not None else "action IS NULL",
+                    ("changed_by = " + sql_quote(changed_by)) if changed_by is not None else "changed_by IS NULL",
                 ]
                 if changed_at_sql:
                     where_parts.append(f"changed_at = '{changed_at_sql}'")
@@ -73,7 +71,7 @@ if st.button("Approve Selected Records"):
                 """
                 session.sql(approve_sql).collect()
 
-                # Parse new_value or old_value to get record details
+                # Parse conditions from new_value/old_value
                 parsed_condition = None
                 if action and action.upper() == "DELETE":
                     # For DELETE, use old_value
@@ -96,7 +94,7 @@ if st.button("Approve Selected Records"):
                             except Exception:
                                 parsed_condition = None
 
-                # Build SQL condition from parsed dict
+                # Build SQL conditions string from parsed dict
                 conditions = None
                 if isinstance(parsed_condition, dict) and parsed_condition:
                     conds = []
@@ -108,7 +106,7 @@ if st.button("Approve Selected Records"):
                             conds.append(f"{k} = '{sval}'")
                     conditions = " AND ".join(conds)
 
-                # Execute database actions based on action type
+                # Execute DB actions
                 if action and action.upper() in ("INSERT", "UPDATE"):
                     if conditions:
                         insert_sql = f"""
@@ -131,10 +129,8 @@ if st.button("Approve Selected Records"):
                     if conditions:
                         delete_sql = f"DELETE FROM {temp_table} WHERE {conditions}"
                         session.sql(delete_sql).collect()
-
-                        # Optional: also delete from main table
+                        # optional: also delete from main table
                         # session.sql(f"DELETE FROM {table_name} WHERE {conditions}").collect()
-
                         approved_count += 1
                     else:
                         st.warning(
@@ -143,40 +139,33 @@ if st.button("Approve Selected Records"):
                         continue
 
                 else:
+                    # Unknown action: mark approved but no DB op
                     approved_count += 1
-                    st.info(
-                        f"Log for action '{action}' approved but no DB operation performed."
-                    )
+                    st.info(f"Log for action '{action}' approved but no DB operation performed.")
 
             except Exception as e:
+                # Properly aligned except block
                 st.error(f"Error approving row: {e}")
                 continue
 
-        # ---- After processing all approvals ----
+        # After loop
         st.info(f"Processed approval attempt. Successfully approved {approved_count} row(s).")
 
-        # Refresh dashboard to show updated pending logs
+        # Refresh pending logs and show updated count/preview
         try:
-            refreshed_pending = session.sql(
-                f"SELECT * FROM {log_table} WHERE approved = FALSE"
-            ).to_pandas()
+            refreshed_pending = session.sql(f"SELECT * FROM {log_table} WHERE approved = FALSE").to_pandas()
         except Exception as e:
             st.error(f"Could not refresh pending logs: {e}")
             refreshed_pending = pd.DataFrame()
 
-        # Display updated count
         pending_count = len(refreshed_pending)
         if pending_count == 0:
             st.success("No more pending approvals.")
         else:
             st.warning(f"Pending Approvals (refreshed): {pending_count} record(s) found.")
-
-            refreshed_pending.columns = [
-                c.lower() for c in refreshed_pending.columns
-            ]
+            refreshed_pending.columns = [c.lower() for c in refreshed_pending.columns]
             display_cols = [
-                c
-                for c in refreshed_pending.columns
+                c for c in refreshed_pending.columns
                 if c not in ["log_id", "domain_id", "approved", "approved_by", "approved_at"]
             ]
             preview_df = refreshed_pending[display_cols].copy().reset_index(drop=True)
