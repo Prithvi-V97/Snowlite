@@ -39,36 +39,54 @@ main_tables = {
     }
 }
 
-# Central log table name used in the UI
 LOG_TABLE = "OMNIDDM.COMMON.DDM_DOMAIN_VALUE_LOG"
 
+# -------------------------
+# Helpers
+# -------------------------
+def normalize_string(s):
+    """Replace non-breaking spaces with normal spaces and trim. Return original if not a string."""
+    if s is None:
+        return None
+    if isinstance(s, str):
+        return s.replace("\u00A0", " ").strip()
+    return s
 
-# -------------------------
-# Helpers: file input
-# -------------------------
+
 def read_uploaded_file(uploaded_file):
+    """
+    Read uploaded Excel or CSV and normalize string cells to remove NBSPs and trim.
+    """
     try:
         if uploaded_file.name.endswith(".xlsx"):
-            return pd.read_excel(uploaded_file, engine="openpyxl")
+            df = pd.read_excel(uploaded_file, engine="openpyxl")
         elif uploaded_file.name.endswith(".csv"):
             try:
-                return pd.read_csv(uploaded_file, encoding="utf-8")
+                df = pd.read_csv(uploaded_file, encoding="utf-8")
             except UnicodeDecodeError:
                 st.warning("File is not UTF-8 encoded. Trying ISO-8859-1...")
-                return pd.read_csv(uploaded_file, encoding="ISO-8859-1")
+                df = pd.read_csv(uploaded_file, encoding="ISO-8859-1")
         else:
             st.error("Unsupported file format. Please upload .xlsx or .csv")
             return None
+
+        # Normalize all string cells to remove NBSP and trim
+        df = df.applymap(lambda x: normalize_string(x) if isinstance(x, str) else x)
+        return df
+
     except Exception as e:
-        st.error(f"Error reading file: {e}")
+        st.error("Error reading file: " + str(e))
         return None
 
 
-# -------------------------
-# Helpers: JSON cleaning + logging
-# -------------------------
 def clean_for_json(obj):
-    """Convert pandas/numpy types to JSON-serializable Python types."""
+    """
+    Recursively convert obj into JSON-serializable native Python types.
+    - pd.NaT / np.nan -> None
+    - pd.Timestamp / datetime/date -> ISO string
+    - numpy scalars -> native python scalars
+    - dict/list -> processed recursively
+    """
     if obj is None:
         return None
 
@@ -110,42 +128,44 @@ def clean_for_json(obj):
 
 
 def log_change(table_name, action, old_value=None, new_value=None):
-    """Write a JSON-cleaned row into the log table."""
+    """
+    Clean values and write an audit row into the log table.
+    Uses $$ ... $$ wrapper to safely store JSON in Snowflake.
+    """
     cleaned_old = clean_for_json(old_value) if old_value is not None else None
     cleaned_new = clean_for_json(new_value) if new_value is not None else None
 
     old_json = json.dumps(cleaned_old) if cleaned_old is not None else None
     new_json = json.dumps(cleaned_new) if cleaned_new is not None else None
 
-    old_sql_val = f"$$ {old_json} $$" if old_json is not None else "NULL"
-    new_sql_val = f"$$ {new_json} $$" if new_json is not None else "NULL"
+    old_sql_val = "$$ " + old_json + " $$" if old_json is not None else "NULL"
+    new_sql_val = "$$ " + new_json + " $$" if new_json is not None else "NULL"
 
-    insert_sql = f"""
-    INSERT INTO {LOG_TABLE}
-    (action, table_name, old_value, new_value, changed_by, changed_at, approved)
-    VALUES
-    (
-      '{action}',
-      '{table_name}',
-      {old_sql_val},
-      {new_sql_val},
-      'streamlit_user',
-      CURRENT_TIMESTAMP,
-      FALSE
+    insert_sql = (
+        "INSERT INTO " + LOG_TABLE + " "
+        "(action, table_name, old_value, new_value, changed_by, changed_at, approved) "
+        "VALUES ("
+        "'" + str(action) + "', "
+        "'" + str(table_name) + "', "
+        + old_sql_val + ", "
+        + new_sql_val + ", "
+        "'streamlit_user', CURRENT_TIMESTAMP, FALSE)"
     )
-    """
     session.sql(insert_sql).collect()
 
 
-# -------------------------
-# Helper: parse new_value / old_value into dict
-# -------------------------
 def parse_new_value(val):
-    """Robust parsing for JSON or Python-literal-like values stored in log."""
+    """
+    Parse a value stored in the log into a dict.
+    Also normalizes string values (replace NBSP and strip).
+    Accepts JSON, JSON-like (single quotes), or Python literal dicts.
+    """
     if val is None:
         raise ValueError("value is None")
+
     if isinstance(val, dict):
-        return val
+        return {k: (v.replace("\u00A0", " ").strip() if isinstance(v, str) else v) for k, v in val.items()}
+
     try:
         if isinstance(val, float) and pd.isna(val):
             raise ValueError("value is NaN")
@@ -157,70 +177,62 @@ def parse_new_value(val):
     if m:
         s = m.group(1).strip()
 
-    # Try proper JSON first
+    # try proper JSON
     try:
         parsed = json.loads(s)
         if isinstance(parsed, dict):
-            return parsed
+            return {k: (v.replace('\u00A0', ' ').strip() if isinstance(v, str) else v) for k, v in parsed.items()}
         else:
-            raise ValueError("json parsed not a dict")
+            raise ValueError("json parsed but not dict")
     except Exception:
         pass
 
-    # Fix common single-quote/unquoted keys
+    # repair common issues: unquoted keys, single quotes
     s_fixed = re.sub(r'([{\[,]\s*)([A-Za-z_][A-Za-z0-9_]*)\s*:', r'\1"\2":', s)
     s_fixed = s_fixed.replace("'", '"')
     try:
         parsed = json.loads(s_fixed)
         if isinstance(parsed, dict):
-            return parsed
+            return {k: (v.replace('\u00A0', ' ').strip() if isinstance(v, str) else v) for k, v in parsed.items()}
     except Exception:
         pass
 
-    # Fallback to ast.literal_eval
+    # fallback to ast.literal_eval
     try:
         parsed = ast.literal_eval(s)
         if isinstance(parsed, dict):
-            return parsed
+            return {k: (v.replace('\u00A0', ' ').strip() if isinstance(v, str) else v) for k, v in parsed.items()}
         else:
             raise ValueError("literal_eval did not yield dict")
     except Exception as e:
-        raise ValueError(f"Could not parse value: {e}; raw={repr(val)}")
+        raise ValueError("Could not parse value: " + str(e) + "; raw=" + repr(val))
 
 
-# -------------------------
-# Helper: fetch main table and sort showing newest on top (if possible)
-# -------------------------
 def fetch_main_table_sorted(table_name):
     """
-    Fetch the main table into a DataFrame.
-    Try to bring recently changed records to the top by checking common timestamp-like columns.
+    Fetch main table and try to bring recently updated records on top.
+    Looks for common timestamp-like columns and sorts descending if found.
     """
     try:
         df = session.table(table_name).to_pandas()
-    except Exception as e:
-        st.error(f"Could not fetch main table {table_name}: {e}")
+    except Exception:
         return pd.DataFrame()
 
-    # List of candidate timestamp columns (lowercase)
     ts_candidates = [c for c in df.columns if c.lower() in ("approved_at", "changed_at", "created_at", "updated_at", "load_ts", "changedat", "approvedat")]
     if ts_candidates:
-        # prefer the first candidate
         ts_col = ts_candidates[0]
         try:
-            # ensure it's datetime & sort descending
             df[ts_col] = pd.to_datetime(df[ts_col], errors="coerce")
             df = df.sort_values(by=ts_col, ascending=False).reset_index(drop=True)
             return df
         except Exception:
             pass
 
-    # fallback: return dataframe as-is
     return df.reset_index(drop=True)
 
 
 # -------------------------
-# Render table UI
+# Render UI for each main table
 # -------------------------
 def render_table_ui(tab, table_key):
     info = main_tables[table_key]
@@ -229,9 +241,9 @@ def render_table_ui(tab, table_key):
     required_cols = info["required_cols"]
 
     with tab:
-        st.subheader(f"Main Table: {main_table}")
+        st.subheader("Main Table: " + main_table)
 
-        # show main table (fetch and sort so newest appear on top if possible)
+        # display main table (sorted)
         main_df = fetch_main_table_sorted(main_table)
         if not main_df.empty:
             st.dataframe(main_df)
@@ -242,7 +254,7 @@ def render_table_ui(tab, table_key):
 
         # ----------------- Upload Section -----------------
         st.markdown("### Upload Excel or CSV (Inserts into TEMP Table)")
-        uploaded_file = st.file_uploader(f"Upload for {table_key}", type=["xlsx", "csv"])
+        uploaded_file = st.file_uploader("Upload for " + table_key, type=["xlsx", "csv"])
         if uploaded_file:
             excel_df = read_uploaded_file(uploaded_file)
             if excel_df is not None:
@@ -251,72 +263,95 @@ def render_table_ui(tab, table_key):
                 st.dataframe(excel_df.head())
 
                 if all(col in excel_df.columns for col in required_cols_upper):
-                    if st.button(f"Upload to TEMP for {table_key}"):
+                    if st.button("Upload to TEMP for " + table_key):
                         inserted = 0
                         for _, row in excel_df.iterrows():
                             cols = ", ".join(required_cols_upper)
                             vals_list = []
                             for col in required_cols_upper:
                                 v = row.get(col, "")
-                                if pd.isna(v):
+                                # normalize strings
+                                if isinstance(v, str):
+                                    v = normalize_string(v)
+                                if pd.isna(v) or v is None or v == "":
                                     vals_list.append("NULL")
                                 else:
                                     sval = str(v).replace("'", "''")
-                                    vals_list.append(f"'{sval}'")
+                                    vals_list.append("'" + sval + "'")
                             vals = ", ".join(vals_list)
-                            insert_sql = f"INSERT INTO {temp_table} ({cols}) VALUES ({vals})"
+                            insert_sql = "INSERT INTO " + temp_table + " (" + cols + ") VALUES (" + vals + ")"
                             session.sql(insert_sql).collect()
-                            row_dict = {c: clean_for_json(row.get(c)) for c in required_cols_upper}
+                            # log normalized inserted row
+                            row_dict = {c: clean_for_json(normalize_string(row.get(c)) if isinstance(row.get(c), str) else row.get(c)) for c in required_cols_upper}
                             log_change(main_table, "INSERT", None, row_dict)
                             inserted += 1
-                        st.success(f"{inserted} rows uploaded to TEMP table and logged.")
+                        st.success(str(inserted) + " rows uploaded to TEMP table and logged.")
                 else:
-                    st.error(f"Missing columns. Required: {required_cols}")
+                    st.error("Missing columns. Required: " + str(required_cols))
 
         # ----------------- Manual Insert -----------------
         st.subheader("Manual Insert into TEMP Table")
-        with st.form(f"insert_form{table_key}"):
+        with st.form("insert_form" + table_key):
             inputs = {col: st.text_input(col) for col in required_cols}
             submit = st.form_submit_button("Insert Record")
             if submit:
                 cols = ", ".join(inputs.keys())
-                vals = ", ".join([f"'{str(v).replace(\"'\",\"''\")}'" if v != "" else "NULL" for v in inputs.values()])
-                insert_sql = f"INSERT INTO {temp_table} ({cols}) VALUES ({vals})"
+                # build cleaned values
+                cleaned_vals = []
+                for v in inputs.values():
+                    if isinstance(v, str):
+                        v = normalize_string(v)
+                    if v == "" or v is None:
+                        cleaned_vals.append("NULL")
+                    else:
+                        cleaned_vals.append("'" + str(v).replace("'", "''") + "'")
+                vals = ", ".join(cleaned_vals)
+                insert_sql = "INSERT INTO " + temp_table + " (" + cols + ") VALUES (" + vals + ")"
                 session.sql(insert_sql).collect()
-                log_change(main_table, "INSERT", None, inputs)
+                # log normalized inputs
+                log_change(main_table, "INSERT", None, {k: normalize_string(v) if isinstance(v, str) else v for k, v in inputs.items()})
                 st.success("Record inserted into TEMP and logged.")
 
         # ----------------- Update (TEMP) -----------------
         st.subheader("Update Record (in TEMP Table)")
-        with st.form(f"update_form_{table_key}"):
-            upd_key = st.text_input(f"{key_col} to Update")
+        with st.form("update_form_" + table_key):
+            upd_key = st.text_input(key_col + " to Update")
             upd_col = st.selectbox("Column to Update", [c for c in required_cols if c != key_col])
             new_value = st.text_input("New Value")
             submit_upd = st.form_submit_button("Update Record")
             if submit_upd:
-                try:
-                    old_val_df = session.sql(f"SELECT {upd_col} FROM {temp_table} WHERE {key_col} = '{upd_key.replace(\"'\",\"''\")}'").to_pandas()
-                    old_val = old_val_df.iloc[0, 0] if not old_val_df.empty else None
-                except Exception:
+                if not upd_key:
                     old_val = None
-                update_sql = f"UPDATE {temp_table} SET {upd_col} = '{new_value.replace(\"'\",\"''\")}' WHERE {key_col} = '{upd_key.replace(\"'\",\"''\")}'"
+                else:
+                    try:
+                        escaped_upd_key = str(normalize_string(upd_key)).replace("'", "''")
+                        old_val_df = session.sql("SELECT " + upd_col + " FROM " + temp_table + " WHERE " + key_col + " = '" + escaped_upd_key + "'").to_pandas()
+                        old_val = old_val_df.iloc[0, 0] if not old_val_df.empty else None
+                    except Exception:
+                        old_val = None
+
+                escaped_new_value = str(normalize_string(new_value)).replace("'", "''")
+                escaped_upd_key = str(normalize_string(upd_key)).replace("'", "''")
+                update_sql = "UPDATE " + temp_table + " SET " + upd_col + " = '" + escaped_new_value + "' WHERE " + key_col + " = '" + escaped_upd_key + "'"
                 session.sql(update_sql).collect()
                 log_change(main_table, "UPDATE", {upd_col: old_val}, {upd_col: new_value})
                 st.success("Record updated in TEMP and logged.")
 
         # ----------------- Delete (TEMP) -----------------
         st.subheader("Delete Record (from TEMP Table)")
-        with st.form(f"delete_form_{table_key}"):
-            del_key = st.text_input(f"{key_col} to Delete")
+        with st.form("delete_form_" + table_key):
+            del_key = st.text_input(key_col + " to Delete")
             confirm = st.checkbox("Confirm Delete")
             submit_del = st.form_submit_button("Delete Record")
             if submit_del and confirm:
                 try:
-                    old_val_df = session.sql(f"SELECT * FROM {temp_table} WHERE {key_col} = '{del_key.replace(\"'\",\"''\")}'").to_pandas()
+                    escaped_del_key = str(normalize_string(del_key)).replace("'", "''")
+                    old_val_df = session.sql("SELECT * FROM " + temp_table + " WHERE " + key_col + " = '" + escaped_del_key + "'").to_pandas()
                     old_val = old_val_df.to_dict(orient="records")[0] if not old_val_df.empty else None
                 except Exception:
                     old_val = None
-                delete_sql = f"DELETE FROM {temp_table} WHERE {key_col} = '{del_key.replace(\"'\",\"''\")}'"
+
+                delete_sql = "DELETE FROM " + temp_table + " WHERE " + key_col + " = '" + escaped_del_key + "'"
                 session.sql(delete_sql).collect()
                 log_change(main_table, "DELETE", old_val, None)
                 st.success("Record deleted from TEMP and logged.")
@@ -331,15 +366,15 @@ st.markdown("## Approval Dashboard")
 
 # Fetch pending logs
 try:
-    pending_logs = session.sql(f"SELECT * FROM {LOG_TABLE} WHERE approved = FALSE").to_pandas()
+    pending_logs = session.sql("SELECT * FROM " + LOG_TABLE + " WHERE approved = FALSE").to_pandas()
 except Exception as e:
-    st.error(f"Could not fetch pending logs: {e}")
+    st.error("Could not fetch pending logs: " + str(e))
     pending_logs = pd.DataFrame()
 
 if pending_logs.empty:
     st.success("No pending approvals.")
 else:
-    st.warning(f"Pending Approvals: {len(pending_logs)} records found.")
+    st.warning("Pending Approvals: " + str(len(pending_logs)) + " records found.")
 
     pending_logs.columns = [c.lower() for c in pending_logs.columns]
     display_cols = [c for c in pending_logs.columns if c not in ["log_id", "domain_id", "approved", "approved_by", "approved_at"]]
@@ -348,7 +383,6 @@ else:
     if "approve" not in display_df.columns:
         display_df["approve"] = False
 
-    # Render approval editor
     edited_df = st.data_editor(
         display_df,
         use_container_width=True,
@@ -369,9 +403,9 @@ else:
     if st.button("Approve Selected Records"):
         # Re-fetch authoritative pending logs (we need log_id and original values)
         try:
-            pending_logs_db = session.sql(f"SELECT * FROM {LOG_TABLE} WHERE approved = FALSE").to_pandas()
+            pending_logs_db = session.sql("SELECT * FROM " + LOG_TABLE + " WHERE approved = FALSE").to_pandas()
         except Exception as e:
-            st.error(f"Could not fetch pending logs for approval: {e}")
+            st.error("Could not fetch pending logs for approval: " + str(e))
             pending_logs_db = pd.DataFrame()
 
         if pending_logs_db.empty:
@@ -379,7 +413,6 @@ else:
         else:
             pending_logs_db.columns = [c.lower() for c in pending_logs_db.columns]
 
-            # Build key map for robust matching: (table_name, action, changed_by, changed_at_iso) -> list of rows
             def row_key_from_db_row(db_row):
                 table_name = str(db_row.get("table_name"))
                 action = str(db_row.get("action")) if db_row.get("action") is not None else ""
@@ -403,7 +436,6 @@ else:
                 approved_count = 0
                 errors = []
 
-                # helper to build SQL literal
                 def sql_literal_for_value(v):
                     if v is None:
                         return "NULL"
@@ -419,7 +451,7 @@ else:
                         return s
                     return "'" + s.replace("'", "''") + "'"
 
-                processed_main_tables = set()  # to inform post-approval UI if needed
+                processed_main_tables = set()
 
                 for _, edited_row in to_approve.iterrows():
                     table_name = edited_row.get("table_name")
@@ -432,11 +464,16 @@ else:
                     except Exception:
                         changed_at_iso = str(changed_at)
 
-                    lookup_key = (str(table_name), str(action) if action is not None else "", str(changed_by) if changed_by is not None else "", changed_at_iso)
+                    lookup_key = (
+                        str(table_name),
+                        str(action) if action is not None else "",
+                        str(changed_by) if changed_by is not None else "",
+                        changed_at_iso
+                    )
                     matched_db_rows = db_key_map.get(lookup_key)
                     if not matched_db_rows:
-                        errors.append(f"No matching DB log found for selected row: {lookup_key}")
-                        st.warning(f"No matching DB log found for selected row: {lookup_key}")
+                        errors.append("No matching DB log found for selected row: " + str(lookup_key))
+                        st.warning("No matching DB log found for selected row: " + str(lookup_key))
                         continue
 
                     db_row = matched_db_rows.pop(0)
@@ -454,22 +491,20 @@ else:
                             break
 
                     if not temp_table:
-                        errors.append(f"TEMP table mapping not found for main table {table_name_db} (log_id={log_id})")
-                        st.error(f"TEMP table mapping not found for main table {table_name_db} (log_id={log_id})")
+                        errors.append("TEMP table mapping not found for main table " + str(table_name_db) + " (log_id=" + str(log_id) + ")")
+                        st.error("TEMP table mapping not found for main table " + str(table_name_db) + " (log_id=" + str(log_id) + ")")
                         continue
 
                     try:
                         # Approve by log_id
-                        approve_sql = f"""
-                            UPDATE {LOG_TABLE}
-                            SET approved = TRUE,
-                                approved_by = 'business_user',
-                                approved_at = CURRENT_TIMESTAMP
-                            WHERE log_id = {log_id} AND approved = FALSE
-                        """
+                        approve_sql = (
+                            "UPDATE " + LOG_TABLE +
+                            " SET approved = TRUE, approved_by = 'business_user', approved_at = CURRENT_TIMESTAMP "
+                            "WHERE log_id = " + str(log_id) + " AND approved = FALSE"
+                        )
                         session.sql(approve_sql).collect()
 
-                        # parse condition dict
+                        # Parse the condition dict using the robust parser (normalized)
                         parsed_condition = None
                         if action_db and str(action_db).upper() == "DELETE":
                             if old_value_db is not None:
@@ -490,59 +525,103 @@ else:
                                     except Exception:
                                         parsed_condition = None
 
-                        # build conditions using uppercase column names
-                        conditions = None
+                        # ----------------- Build and try conditions with NBSP-normalization fallback -----------------
+                        conditions_exact = None
+                        conditions_normalized = None
+
                         if isinstance(parsed_condition, dict) and parsed_condition:
-                            conds = []
+                            conds_exact = []
+                            conds_normalized = []
                             for k, v in parsed_condition.items():
                                 col_name = str(k).upper()
                                 if v is None:
-                                    conds.append(f"{col_name} IS NULL")
+                                    conds_exact.append(col_name + " IS NULL")
+                                    conds_normalized.append(col_name + " IS NULL")
+                                    continue
+
+                                sval = str(v).strip()
+                                sval_norm = sval.replace("\u00A0", " ").strip()
+
+                                if re.fullmatch(r"-?\d+(\.\d+)?", sval):
+                                    conds_exact.append(col_name + " = " + sval)
+                                    conds_normalized.append(col_name + " = " + sval)
                                 else:
-                                    lit = sql_literal_for_value(v)
-                                    conds.append(f"{col_name} = {lit}")
-                            conditions = " AND ".join(conds)
+                                    escaped = sval.replace("'", "''")
+                                    conds_exact.append(col_name + " = '" + escaped + "'")
+                                    escaped_norm = sval_norm.replace("'", "''")
+                                    conds_normalized.append("TRIM(REPLACE(" + col_name + ", CHR(160), ' ')) = '" + escaped_norm + "'")
+
+                            conditions_exact = " AND ".join(conds_exact)
+                            conditions_normalized = " AND ".join(conds_normalized)
+
+                        def temp_count_for_where(where_clause):
+                            try:
+                                count_df = session.sql("SELECT COUNT(*) AS CNT FROM " + temp_table + " WHERE " + where_clause).to_pandas()
+                                return int(count_df.iloc[0]["CNT"]) if not count_df.empty else 0
+                            except Exception:
+                                return 0
+
+                        rows_matched = 0
+                        use_where = None
+                        if conditions_exact:
+                            rows_matched = temp_count_for_where(conditions_exact)
+                            if rows_matched > 0:
+                                use_where = conditions_exact
+
+                        if (use_where is None) and conditions_normalized:
+                            rows_matched = temp_count_for_where(conditions_normalized)
+                            if rows_matched > 0:
+                                use_where = conditions_normalized
 
                         action_upper = str(action_db).upper() if action_db is not None else ""
+
                         if action_upper in ("INSERT", "UPDATE"):
-                            if conditions:
-                                insert_sql = f"INSERT INTO {table_name_db} SELECT * FROM {temp_table} WHERE {conditions}"
+                            if use_where:
+                                insert_sql = "INSERT INTO " + table_name_db + " SELECT * FROM " + temp_table + " WHERE " + use_where
                                 session.sql(insert_sql).collect()
-                                session.sql(f"DELETE FROM {temp_table} WHERE {conditions}").collect()
+                                session.sql("DELETE FROM " + temp_table + " WHERE " + use_where).collect()
                                 approved_count += 1
                                 processed_main_tables.add(table_name_db)
                             else:
-                                errors.append(f"Could not build conditions for INSERT/UPDATE (log_id={log_id})")
-                                st.error(f"Could not build conditions for INSERT/UPDATE (log_id={log_id})")
+                                errors.append("Could not build conditions for INSERT/UPDATE (log_id=" + str(log_id) + ")")
+                                st.error("Could not build conditions for INSERT/UPDATE (log_id=" + str(log_id) + ")")
                                 continue
 
                         elif action_upper == "DELETE":
-                            if conditions:
-                                session.sql(f"DELETE FROM {temp_table} WHERE {conditions}").collect()
+                            if use_where:
+                                session.sql("DELETE FROM " + temp_table + " WHERE " + use_where).collect()
                                 approved_count += 1
                                 processed_main_tables.add(table_name_db)
                             else:
-                                errors.append(f"Could not build delete conditions for log_id={log_id}")
-                                st.warning(f"Approved DELETE log but couldn't build delete condition for log_id={log_id}")
+                                errors.append("Could not build delete conditions for log_id=" + str(log_id))
+                                st.warning("Approved DELETE log but couldn't build delete condition for log_id=" + str(log_id))
                                 continue
                         else:
-                            # unknown action — approved only
                             approved_count += 1
 
                     except Exception as e:
-                        errors.append(f"Error processing log_id={log_id}: {e}")
-                        st.error(f"Error processing log_id={log_id}: {e}")
+                        errors.append("Error processing log_id=" + str(log_id) + ": " + str(e))
+                        st.error("Error processing log_id=" + str(log_id) + ": " + str(e))
                         continue
 
                 # end loop over selected rows
 
-                st.success(f"Approval run complete. Successfully applied {approved_count} row(s).")
+                st.success("Approval run complete. Successfully applied " + str(approved_count) + " row(s).")
                 if errors:
                     st.warning("Some errors occurred during approval. Check messages above.")
 
-                # Re-run app so the original UI re-fetches pending logs and main tables (no extra tables shown)
-                # This rerun will cause the approval dashboard to refresh and the existing main table areas to show latest data.
-                st.experimental_rerun()
+                # Try to rerun/refresh the app so approval dashboard and main table displays update.
+                try:
+                    if hasattr(st, "experimental_rerun"):
+                        st.experimental_rerun()
+                    elif hasattr(st, "rerun"):
+                        st.rerun()
+                    else:
+                        import streamlit.components.v1 as components
+                        components.html("<script>window.location.reload()</script>", height=0)
+                except Exception:
+                    import streamlit.components.v1 as components
+                    components.html("<script>window.location.reload()</script>", height=0)
 
 # -------------------------
 # Tabs for Main Tables
