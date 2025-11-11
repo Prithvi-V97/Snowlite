@@ -6,13 +6,18 @@ import pandas as pd
 from snowflake.snowpark.context import get_active_session
 from datetime import datetime
 
+# ----------------------------------------------------------------------
+# Streamlit Setup
+# ----------------------------------------------------------------------
 st.set_page_config(
     page_title="DDM Dual Table DML Dashboard with Approval Workflow",
-    layout="wide"
+    layout="wide",
 )
 st.title("DDM Dual Table DML Dashboard with Approval Workflow (TEMP + LOG Enhanced)")
 
-# Get active Snowpark session (assumes Streamlit is running in environment with session available)
+# ----------------------------------------------------------------------
+# Get Snowpark session
+# ----------------------------------------------------------------------
 session = get_active_session()
 
 # Try adding openpyxl for Excel uploads (best-effort)
@@ -22,7 +27,7 @@ except Exception:
     st.warning("Could not add openpyxl automatically. If Excel upload fails, use CSV instead.")
 
 # ----------------------------------------------------------------------
-# Table Mappings (Main, Temp, and Log)
+# Table Mappings
 # ----------------------------------------------------------------------
 main_tables = {
     "DDM_DOMAIN_VALUE": {
@@ -34,7 +39,7 @@ main_tables = {
     "DDM_XREF_DOMAIN_VALUE": {
         "name": "OMNIDDM.COMMON.DDM_XREF_DOMAIN_VALUE",
         "temp": "OMNIDDM.COMMON.DDM_XREF_DOMAIN_VALUE_TEMP",
-        "log": "OMNIDDM.COMMON.DDM_DOMAIN_VALUE_LOG",  # using same log structure
+        "log": "OMNIDDM.COMMON.DDM_DOMAIN_VALUE_LOG",  # Using same log
         "required_cols": [
             "SOURCEENTITY",
             "SOURCEDOMAIN",
@@ -45,39 +50,29 @@ main_tables = {
     },
 }
 
-
 # ----------------------------------------------------------------------
-# Helpers: sanitize for log + robust parsing for new_value
+# Helper Functions
 # ----------------------------------------------------------------------
 def sanitize_for_log(obj):
-    """
-    Convert dict-like objects to JSON-serializable and clean strings:
-    - Convert numpy/pandas NaN -> None
-    - Strip non-breaking spaces (\u00a0) from strings and trim
-    """
+    """Sanitize objects for JSON/log storage."""
     if obj is None:
         return None
-
     if isinstance(obj, dict):
-        out = {}
+        cleaned = {}
         for k, v in obj.items():
             if isinstance(v, str):
-                out[k] = v.replace("\u00a0", " ").strip()
+                cleaned[k] = v.replace("\u00a0", " ").strip()
             else:
-                try:
-                    if isinstance(v, float) and (v != v):
-                        out[k] = None
-                    else:
-                        out[k] = v
-                except Exception:
-                    out[k] = v
-        return out
-
+                if isinstance(v, float) and (v != v):  # NaN check
+                    cleaned[k] = None
+                else:
+                    cleaned[k] = v
+        return cleaned
     return obj
 
 
 def log_change(log_table, table_name, action, old_value=None, new_value=None):
-    """Insert a row into the appropriate log table."""
+    """Insert a log entry."""
     old_s = sanitize_for_log(old_value)
     new_s = sanitize_for_log(new_value)
 
@@ -95,10 +90,8 @@ def log_change(log_table, table_name, action, old_value=None, new_value=None):
     new_val_sql = f"$$ {new_json} $$" if new_json else "NULL"
 
     insert_sql = f"""
-        INSERT INTO {log_table}
-        (action, table_name, old_value, new_value, changed_by, changed_at, approved)
-        VALUES
-        (
+        INSERT INTO {log_table} (action, table_name, old_value, new_value, changed_by, changed_at, approved)
+        VALUES (
             '{action}',
             '{table_name}',
             {old_val_sql},
@@ -108,38 +101,20 @@ def log_change(log_table, table_name, action, old_value=None, new_value=None):
             FALSE
         )
     """
+
     try:
         session.sql(insert_sql).collect()
     except Exception as e:
-        st.error(f"Failed to write audit log to {log_table}: {e}")
-
-
-def _sanitize_dict_values(d):
-    out = {}
-    for k, v in d.items():
-        if isinstance(v, str):
-            out[k] = v.replace("\u00a0", " ").strip()
-        else:
-            try:
-                if isinstance(v, float) and (v != v):
-                    out[k] = None
-                else:
-                    out[k] = v
-            except Exception:
-                out[k] = v
-    return out
+        st.error(f"Failed to insert log: {e}")
 
 
 def parse_new_value(raw):
-    """
-    Robustly parse the `new_value` column from the log table.
-    Accepts strings that are JSON-like or Python-literal dicts.
-    """
+    """Parse new_value JSON or Python dict from log table."""
     if raw is None:
         raise ValueError("new_value is None")
 
     if isinstance(raw, dict):
-        return _sanitize_dict_values(raw)
+        return {k: v for k, v in raw.items()}
 
     s = str(raw).strip()
     if s.startswith("$$") and s.endswith("$$"):
@@ -151,7 +126,7 @@ def parse_new_value(raw):
     try:
         parsed = json.loads(s_json_ready)
         if isinstance(parsed, dict):
-            return _sanitize_dict_values(parsed)
+            return parsed
     except Exception:
         pass
 
@@ -159,17 +134,15 @@ def parse_new_value(raw):
     try:
         parsed = ast.literal_eval(s_py_ready)
         if isinstance(parsed, dict):
-            return _sanitize_dict_values(parsed)
-        else:
-            raise ValueError(f"Parsed value is not a dict (type={type(parsed)}).")
+            return parsed
     except Exception as e:
-        raise ValueError(f"Failed to parse new_value '{raw}' as dict: {e}")
+        raise ValueError(f"Failed to parse new_value: {e}")
+
+    raise ValueError("Could not parse new_value")
 
 
-# ----------------------------------------------------------------------
-# File reader helper
-# ----------------------------------------------------------------------
 def read_uploaded_file(uploaded_file):
+    """Read Excel or CSV file."""
     try:
         if uploaded_file.name.endswith(".xlsx"):
             return pd.read_excel(uploaded_file, engine="openpyxl")
@@ -177,18 +150,16 @@ def read_uploaded_file(uploaded_file):
             try:
                 return pd.read_csv(uploaded_file, encoding="utf-8")
             except UnicodeDecodeError:
-                st.warning("File not UTF-8 encoded. Trying ISO-8859-1...")
                 return pd.read_csv(uploaded_file, encoding="ISO-8859-1")
         else:
-            st.error("Unsupported file format. Please upload .xlsx or .csv")
+            st.error("Unsupported file type.")
             return None
     except Exception as e:
         st.error(f"Error reading file: {e}")
         return None
 
-
 # ----------------------------------------------------------------------
-# Render UI per table
+# Table UI
 # ----------------------------------------------------------------------
 def render_table_ui(tab, table_key):
     info = main_tables[table_key]
@@ -203,128 +174,117 @@ def render_table_ui(tab, table_key):
             df = session.table(main_table).to_pandas()
             st.dataframe(df, use_container_width=True)
         except Exception as e:
-            st.error(f"Could not read main table {main_table}: {e}")
+            st.error(f"Could not read main table: {e}")
 
         key_col = required_cols[-1]
 
-        # -------------------
-        # Upload Section
-        # -------------------
-        st.markdown(f"### Upload Excel or CSV for {table_key} (Inserts into TEMP Table)")
-        uploaded_file = st.file_uploader(
-            f"Upload for {table_key}", type=["xlsx", "csv"], key=f"upload_{table_key}"
-        )
+        # ---------------- Upload ----------------
+        st.markdown(f"### Upload Excel or CSV for {table_key}")
+        uploaded_file = st.file_uploader(f"Upload for {table_key}", type=["xlsx", "csv"], key=f"upload_{table_key}")
 
         if uploaded_file:
             excel_df = read_uploaded_file(uploaded_file)
             if excel_df is not None:
                 excel_df.columns = [col.strip().upper() for col in excel_df.columns]
-                required_cols_upper = [col.upper() for col in required_cols]
                 st.dataframe(excel_df.head())
 
-                if all(col in excel_df.columns for col in required_cols_upper):
+                if all(col in excel_df.columns for col in [c.upper() for c in required_cols]):
                     if st.button(f"Upload to TEMP for {table_key}", key=f"btn_upload_{table_key}"):
                         inserted = 0
                         for _, row in excel_df.iterrows():
                             try:
-                                cols = ", ".join(required_cols_upper)
-                                vals = ", ".join([
-                                    f"'{str(row[col]).replace(\"'\", \"''\")}'"
-                                    if pd.notna(row[col]) else "NULL"
-                                    for col in required_cols_upper
-                                ])
+                                cols = ", ".join([c.upper() for c in required_cols])
+                                vals_list = []
+                                for col in required_cols:
+                                    val = row[col.upper()]
+                                    if pd.isna(val):
+                                        vals_list.append("NULL")
+                                    else:
+                                        safe_val = str(val).replace("'", "''")
+                                        vals_list.append(f"'{safe_val}'")
+                                vals = ", ".join(vals_list)
+
                                 insert_sql = f"INSERT INTO {temp_table} ({cols}) VALUES ({vals})"
                                 session.sql(insert_sql).collect()
 
-                                row_dict = {
-                                    col: (None if pd.isna(row[col])
-                                          else str(row[col]).replace("\u00a0", " ").strip())
-                                    for col in required_cols_upper
-                                }
+                                row_dict = {col.upper(): None if pd.isna(row[col.upper()]) else str(row[col.upper()]).strip() for col in required_cols}
                                 log_change(log_table, main_table, "INSERT", None, row_dict)
                                 inserted += 1
                             except Exception as e:
-                                st.error(f"Failed inserting row to {temp_table}: {e}")
-                        st.success(f"Uploaded {inserted} rows to TEMP table and logged.")
+                                st.error(f"Error inserting row: {e}")
+                        st.success(f"Uploaded {inserted} rows to TEMP and logged.")
                 else:
-                    st.error(f"Missing columns. Required: {required_cols}")
+                    st.error(f"Missing required columns: {required_cols}")
 
-        # -------------------
-        # Manual Insert
-        # -------------------
-        st.subheader("Manual Insert into TEMP Table")
+        # ---------------- Manual Insert ----------------
+        st.subheader("Manual Insert into TEMP")
         with st.form(f"insert_form_{table_key}"):
             inputs = {col: st.text_input(col) for col in required_cols}
             submit = st.form_submit_button("Insert Record")
             if submit:
                 try:
-                    cols = ", ".join([c.upper() for c in inputs.keys()])
-                    vals = ", ".join([
-                        f"'{v.replace(\"'\", \"''\")}'" if v != "" else "NULL"
-                        for v in inputs.values()
-                    ])
-                    insert_sql = f"INSERT INTO {temp_table} ({cols}) VALUES ({vals})"
-                    session.sql(insert_sql).collect()
-                    log_change(
-                        log_table,
-                        main_table,
-                        "INSERT",
-                        None,
-                        {k.upper(): (None if v == "" else v.replace("\u00a0", " ").strip())
-                         for k, v in inputs.items()},
-                    )
-                    st.success("Record inserted into TEMP and logged.")
-                except Exception as e:
-                    st.error(f"Failed manual insert: {e}")
+                    cols = ", ".join(inputs.keys())
+                    vals = []
+                    for v in inputs.values():
+                        if v.strip() == "":
+                            vals.append("NULL")
+                        else:
+                            vals.append(f"'{v.replace('\'', '\'\'')}'")
+                    val_str = ", ".join(vals)
 
-        # -------------------
-        # Update Record (TEMP)
-        # -------------------
-        st.subheader("Update Record (in TEMP Table)")
+                    sql = f"INSERT INTO {temp_table} ({cols}) VALUES ({val_str})"
+                    session.sql(sql).collect()
+
+                    log_change(log_table, main_table, "INSERT", None, inputs)
+                    st.success("Record inserted and logged.")
+                except Exception as e:
+                    st.error(f"Insert failed: {e}")
+
+        # ---------------- Update ----------------
+        st.subheader("Update Record in TEMP")
         with st.form(f"update_form_{table_key}"):
-            upd_key = st.text_input(f"{key_col} to Update")
-            upd_col = st.selectbox("Column to Update", [c for c in required_cols if c != key_col])
+            upd_key = st.text_input(f"{key_col} to update")
+            upd_col = st.selectbox("Column to update", [c for c in required_cols if c != key_col])
             new_value = st.text_input("New Value")
-            submit_upd = st.form_submit_button("Update Record")
-            if submit_upd:
+            submit = st.form_submit_button("Update")
+            if submit:
                 try:
-                    old_val_df = session.sql(
-                        f"SELECT {upd_col} FROM {temp_table} WHERE {key_col} = '{upd_key.replace(\"'\", \"''\")}'"
+                    old_df = session.sql(
+                        f"SELECT {upd_col} FROM {temp_table} WHERE {key_col} = '{upd_key.replace('\'', '\'\'')}'"
                     ).to_pandas()
-                    old_val = old_val_df.iloc[0, 0] if not old_val_df.empty else None
+                    old_val = old_df.iloc[0, 0] if not old_df.empty else None
+
                     update_sql = (
-                        f"UPDATE {temp_table} SET {upd_col} = '{new_value.replace(\"'\", \"''\")}' "
-                        f"WHERE {key_col} = '{upd_key.replace(\"'\", \"''\")}'"
+                        f"UPDATE {temp_table} SET {upd_col} = '{new_value.replace('\'', '\'\'')}' "
+                        f"WHERE {key_col} = '{upd_key.replace('\'', '\'\'')}'"
                     )
                     session.sql(update_sql).collect()
                     log_change(log_table, main_table, "UPDATE", {upd_col: old_val}, {upd_col: new_value})
-                    st.success("Record updated in TEMP and logged.")
+                    st.success("Updated record and logged.")
                 except Exception as e:
-                    st.error(f"Failed updating record: {e}")
+                    st.error(f"Update failed: {e}")
 
-        # -------------------
-        # Delete Record (TEMP)
-        # -------------------
-        st.subheader("Delete Record (from TEMP Table)")
+        # ---------------- Delete ----------------
+        st.subheader("Delete Record from TEMP")
         with st.form(f"delete_form_{table_key}"):
-            del_key = st.text_input(f"{key_col} to Delete")
-            confirm = st.checkbox("Confirm Delete")
-            submit_del = st.form_submit_button("Delete Record")
-            if submit_del and confirm:
+            del_key = st.text_input(f"{key_col} to delete")
+            confirm = st.checkbox("Confirm delete")
+            submit = st.form_submit_button("Delete")
+            if submit and confirm:
                 try:
-                    old_val_df = session.sql(
-                        f"SELECT * FROM {temp_table} WHERE {key_col} = '{del_key.replace(\"'\", \"''\")}'"
+                    old_df = session.sql(
+                        f"SELECT * FROM {temp_table} WHERE {key_col} = '{del_key.replace('\'', '\'\'')}'"
                     ).to_pandas()
-                    old_val = old_val_df.to_dict(orient="records")[0] if not old_val_df.empty else None
-                    delete_sql = f"DELETE FROM {temp_table} WHERE {key_col} = '{del_key.replace(\"'\", \"''\")}'"
+                    old_val = old_df.to_dict(orient="records")[0] if not old_df.empty else None
+
+                    delete_sql = f"DELETE FROM {temp_table} WHERE {key_col} = '{del_key.replace('\'', '\'\'')}'"
                     session.sql(delete_sql).collect()
                     log_change(log_table, main_table, "DELETE", old_val, None)
-                    st.success("Record deleted from TEMP and logged.")
+                    st.success("Deleted record and logged.")
                 except Exception as e:
-                    st.error(f"Failed deleting record: {e}")
-            elif submit_del:
-                st.warning("Please confirm delete before proceeding.")
-
+                    st.error(f"Delete failed: {e}")
+            elif submit:
+                st.warning("Please confirm deletion before proceeding.")
 
 # ----------------------------------------------------------------------
 # Approval Dashboard
@@ -332,127 +292,80 @@ def render_table_ui(tab, table_key):
 st.markdown("## Approval Dashboard")
 
 log_tables = sorted({info["log"] for info in main_tables.values()})
-pending_frames = []
+pending_logs = []
 
 for lt in log_tables:
     try:
-        df = session.sql(f"SELECT *, '{lt}' as log_table_source FROM {lt} WHERE approved = FALSE").to_pandas()
+        df = session.sql(f"SELECT *, '{lt}' AS log_table_source FROM {lt} WHERE approved = FALSE").to_pandas()
         if not df.empty:
-            pending_frames.append(df)
+            pending_logs.append(df)
     except Exception:
-        st.warning(f"Could not read log table {lt} (it may not exist or there was an error).")
+        st.warning(f"Could not read log table: {lt}")
 
-if not pending_frames:
+if not pending_logs:
     st.success("No pending approvals.")
 else:
-    pending_logs = pd.concat(pending_frames, ignore_index=True)
-    st.warning(f"Pending Approvals: {len(pending_logs)} records found.")
+    pending_df = pd.concat(pending_logs, ignore_index=True)
+    st.warning(f"{len(pending_df)} pending approvals found.")
+    pending_df.columns = [c.lower() for c in pending_df.columns]
 
-    pending_logs.columns = [c.lower() for c in pending_logs.columns]
     display_cols = [
-        c for c in pending_logs.columns
-        if c not in ["log_id", "domain_id", "approved", "approved_by", "approved_at"]
+        c for c in pending_df.columns if c not in ["log_id", "approved", "approved_by", "approved_at"]
     ]
-    display_df = pending_logs[display_cols].copy()
-    display_df.reset_index(drop=True, inplace=True)
+    display_df = pending_df[display_cols].copy()
+    display_df["approve"] = False
 
-    if "approve" not in display_df.columns:
-        display_df["approve"] = False
-
-    edited_df = st.data_editor(
+    edited = st.data_editor(
         display_df,
         use_container_width=True,
-        height=400,
-        column_config={
-            "approve": st.column_config.CheckboxColumn(
-                "Approve", help="Tick to approve this record", width=80
-            )
-        },
-        hide_index=True,
+        column_config={"approve": st.column_config.CheckboxColumn("Approve", help="Select to approve")},
     )
 
     if st.button("Approve Selected Records"):
-        to_approve = edited_df[edited_df["approve"]]
+        to_approve = edited[edited["approve"]]
         if to_approve.empty:
-            st.warning("No rows selected for approval.")
+            st.warning("No records selected.")
         else:
             approved_count = 0
-            for _, log_row in to_approve.iterrows():
-                table_name = log_row.get("table_name")
-                new_value = log_row.get("new_value")
-                changed_by = str(log_row.get("changed_by"))
-                changed_at = log_row.get("changed_at")
-                action = log_row.get("action")
-                log_table_source = log_row.get("log_table_source")
-
-                temp_table = None
-                for info in main_tables.values():
-                    if info["name"] == table_name:
-                        temp_table = info["temp"]
-                        break
-
-                if not temp_table:
-                    st.error(f"TEMP table not found for {table_name}. Skipping.")
-                    continue
-
+            for _, row in to_approve.iterrows():
                 try:
-                    if pd.isna(changed_at):
-                        changed_at_condition = "1=1"
-                    else:
-                        changed_at_str = str(changed_at).replace("'", "''")
-                        changed_at_condition = f"changed_at = '{changed_at_str}'"
-                except Exception:
-                    changed_at_condition = "1=1"
+                    log_table = row["log_table_source"]
+                    table_name = row["table_name"]
+                    new_value = row["new_value"]
+                    changed_by = str(row["changed_by"])
+                    action = row["action"]
 
-                approve_sql = f"""
-                    UPDATE {log_table_source}
-                    SET approved = TRUE,
-                        approved_by = 'business_user',
-                        approved_at = CURRENT_TIMESTAMP
-                    WHERE table_name = '{str(table_name).replace("'", "''")}'
-                      AND action = '{str(action).replace("'", "''")}'
-                      AND changed_by = '{changed_by.replace("'", "''")}'
-                      AND {changed_at_condition}
-                      AND approved = FALSE
-                """
-                try:
+                    approve_sql = f"""
+                        UPDATE {log_table}
+                        SET approved = TRUE, approved_by = 'business_user', approved_at = CURRENT_TIMESTAMP
+                        WHERE table_name = '{table_name.replace("'", "''")}'
+                          AND action = '{action.replace("'", "''")}'
+                          AND changed_by = '{changed_by.replace("'", "''")}'
+                          AND approved = FALSE
+                    """
                     session.sql(approve_sql).collect()
-                except Exception as e:
-                    st.error(f"Failed to mark log as approved in {log_table_source}: {e}")
-                    continue
 
-                if new_value:
-                    try:
+                    if new_value:
                         new_val_dict = parse_new_value(new_value)
-                    except ValueError as e:
-                        st.error(f"Error approving row: {e}")
-                        continue
-
-                    try:
                         conds = []
                         for k, v in new_val_dict.items():
-                            col = k
                             if v is None:
-                                conds.append(f"{col} IS NULL")
+                                conds.append(f"{k} IS NULL")
                             else:
-                                safe_val = str(v).replace("'", "''")
-                                conds.append(f"{col} = '{safe_val}'")
-                        conditions = " AND ".join(conds) if conds else "1=1"
-                    except Exception as e:
-                        st.error(f"Error building SQL conditions from new_value: {e}")
-                        continue
+                                conds.append(f"{k} = '{str(v).replace("'", "''")}'")
+                        where_clause = " AND ".join(conds) if conds else "1=1"
 
-                    try:
-                        insert_sql = f"INSERT INTO {table_name} SELECT * FROM {temp_table} WHERE {conditions}"
-                        session.sql(insert_sql).collect()
-                        session.sql(f"DELETE FROM {temp_table} WHERE {conditions}").collect()
-                        approved_count += 1
-                    except Exception as e:
-                        st.error(f"Failed to apply change from {temp_table} to {table_name}: {e}")
-                        continue
+                        temp_table = next((info["temp"] for info in main_tables.values() if info["name"] == table_name), None)
+                        if temp_table:
+                            insert_sql = f"INSERT INTO {table_name} SELECT * FROM {temp_table} WHERE {where_clause}"
+                            delete_sql = f"DELETE FROM {temp_table} WHERE {where_clause}"
+                            session.sql(insert_sql).collect()
+                            session.sql(delete_sql).collect()
+                            approved_count += 1
+                except Exception as e:
+                    st.error(f"Approval failed: {e}")
 
-            st.success(f"Approved {approved_count} selected rows and applied to main tables.")
-
+            st.success(f"Approved and applied {approved_count} records.")
 
 # ----------------------------------------------------------------------
 # Tabs for main tables
