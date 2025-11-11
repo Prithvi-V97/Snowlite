@@ -1,4 +1,4 @@
-# ----------------- Approval handler (fixed: use log_id, precise matching) -----------------
+# ----------------- Approval handler (final, shows main tables after approve) -----------------
 if st.button("Approve Selected Records"):
     # Re-fetch authoritative pending logs from DB so we have log_id and original values
     try:
@@ -10,21 +10,17 @@ if st.button("Approve Selected Records"):
     if pending_logs_db.empty:
         st.info("No pending logs found in DB at approval time.")
     else:
-        # normalize names for easier matching
+        # normalize column names for matching
         pending_logs_db.columns = [c.lower() for c in pending_logs_db.columns]
 
-        # Build a map keyed by a composite key we can reproduce from edited_df rows.
-        # We'll use (table_name, action, changed_by, changed_at_iso) as the matching key.
+        # Build map keyed by (table_name, action, changed_by, changed_at_iso) -> list of db rows
         def row_key_from_db_row(db_row):
             table_name = str(db_row.get("table_name"))
             action = str(db_row.get("action")) if db_row.get("action") is not None else ""
             changed_by = str(db_row.get("changed_by")) if db_row.get("changed_by") is not None else ""
             changed_at = db_row.get("changed_at")
-            # normalize timestamp to iso string for stable comparisons
             try:
-                changed_at_iso = (
-                    changed_at.isoformat() if hasattr(changed_at, "isoformat") else str(changed_at)
-                )
+                changed_at_iso = changed_at.isoformat() if hasattr(changed_at, "isoformat") else str(changed_at)
             except Exception:
                 changed_at_iso = str(changed_at)
             return (table_name, action, changed_by, changed_at_iso)
@@ -32,10 +28,9 @@ if st.button("Approve Selected Records"):
         db_key_map = {}
         for _, r in pending_logs_db.iterrows():
             key = row_key_from_db_row(r)
-            # if duplicates exist, store list (rare) — we'll pop the first match
             db_key_map.setdefault(key, []).append(r)
 
-        # Which rows the user ticked
+        # Which rows user ticked
         to_approve = edited_df[edited_df["approve"] == True]
         if to_approve.empty:
             st.warning("No rows selected for approval.")
@@ -43,47 +38,60 @@ if st.button("Approve Selected Records"):
             approved_count = 0
             errors = []
 
-            # Helper: safely escape SQL string values
-            def sql_quote(v):
+            # helper to build SQL literal (quotes only when needed)
+            def sql_literal_for_value(v):
+                # None -> SQL NULL
                 if v is None:
                     return "NULL"
-                s = str(v)
+                # numpy/pandas NA
+                try:
+                    if pd.isna(v):
+                        return "NULL"
+                except Exception:
+                    pass
+
+                # If it's already numeric type
+                if isinstance(v, (int, float, np.integer, np.floating)) and not isinstance(v, (bool, np.bool_)):
+                    return str(v)
+
+                # Try to detect numeric strings (integers or floats)
+                s = str(v).strip()
+                # allow negative and decimal numbers
+                if re.fullmatch(r"-?\d+(\.\d+)?", s):
+                    return s
+
+                # otherwise escape single quotes and quote
                 return "'" + s.replace("'", "''") + "'"
 
             for _, edited_row in to_approve.iterrows():
-                # get identifying fields from edited table (these are lowercase columns)
                 table_name = edited_row.get("table_name")
                 action = edited_row.get("action")
                 changed_by = edited_row.get("changed_by")
                 changed_at = edited_row.get("changed_at")
 
-                # normalize to strings for key matching
                 try:
-                    changed_at_iso = (
-                        changed_at.isoformat() if hasattr(changed_at, "isoformat") else str(changed_at)
-                    )
+                    changed_at_iso = changed_at.isoformat() if hasattr(changed_at, "isoformat") else str(changed_at)
                 except Exception:
                     changed_at_iso = str(changed_at)
 
                 lookup_key = (str(table_name), str(action) if action is not None else "", str(changed_by) if changed_by is not None else "", changed_at_iso)
-
                 matched_db_rows = db_key_map.get(lookup_key)
                 if not matched_db_rows:
                     errors.append(f"No matching DB log found for selected row: {lookup_key}")
                     st.warning(f"No matching DB log found for selected row: {lookup_key}")
                     continue
 
-                # pop the first matching DB row so duplicates don't all match the same one
+                # Pop first match to avoid reusing same db row
                 db_row = matched_db_rows.pop(0)
 
-                # extract required fields from DB row
+                # Extract authoritative values from DB row
                 log_id = db_row.get("log_id")
                 new_value_db = db_row.get("new_value")
                 old_value_db = db_row.get("old_value")
-                table_name_db = db_row.get("table_name")  # full main table name
+                table_name_db = db_row.get("table_name")
                 action_db = db_row.get("action")
 
-                # Find TEMP table mapping from main_tables
+                # Find temp table mapping for this main table
                 temp_table = None
                 for key, info in main_tables.items():
                     if info.get("name") == table_name_db:
@@ -93,11 +101,10 @@ if st.button("Approve Selected Records"):
                 if not temp_table:
                     errors.append(f"TEMP table mapping not found for main table {table_name_db} (log_id={log_id})")
                     st.error(f"TEMP table mapping not found for main table {table_name_db} (log_id={log_id})")
-                    # Even if temp table missing, still mark log as approved? skip for now
                     continue
 
                 try:
-                    # Approve the exact log row by log_id (single-row update)
+                    # Approve the exact log row by log_id
                     approve_sql = f"""
                         UPDATE {log_table}
                         SET approved = TRUE,
@@ -107,10 +114,9 @@ if st.button("Approve Selected Records"):
                     """
                     session.sql(approve_sql).collect()
 
-                    # Decide which value to use for constructing conditions
+                    # Choose which value to parse for building WHERE conditions
                     parsed_condition = None
                     if action_db and str(action_db).upper() == "DELETE":
-                        # prefer old_value for deletes
                         if old_value_db is not None:
                             try:
                                 parsed_condition = parse_new_value(old_value_db)
@@ -129,37 +135,38 @@ if st.button("Approve Selected Records"):
                                 except Exception:
                                     parsed_condition = None
 
-                    # Build SQL conditions from parsed dict
+                    # Build SQL conditions; column names uppercase to match Snowflake temp table schema
                     conditions = None
                     if isinstance(parsed_condition, dict) and parsed_condition:
                         conds = []
                         for k, v in parsed_condition.items():
+                            col_name = str(k).upper()  # FORCE uppercase to match temp/main schema
                             if v is None:
-                                conds.append(f"{k} IS NULL")
+                                conds.append(f"{col_name} IS NULL")
                             else:
-                                sval = str(v).replace("'", "''")
-                                conds.append(f"{k} = '{sval}'")
+                                lit = sql_literal_for_value(v)
+                                conds.append(f"{col_name} = {lit}")
                         conditions = " AND ".join(conds)
 
-                    # Apply DB operations in a deterministic way
+                    # Apply DB operations
                     action_upper = str(action_db).upper() if action_db is not None else ""
                     if action_upper in ("INSERT", "UPDATE"):
                         if conditions:
+                            # Insert matching rows from TEMP into MAIN
                             insert_sql = f"INSERT INTO {table_name_db} SELECT * FROM {temp_table} WHERE {conditions}"
                             session.sql(insert_sql).collect()
+                            # Delete those rows from TEMP after successful insert
                             session.sql(f"DELETE FROM {temp_table} WHERE {conditions}").collect()
                             approved_count += 1
                         else:
-                            # If no conditions, do NOT attempt a blind insert; notify user
                             errors.append(f"Could not build conditions for INSERT/UPDATE (log_id={log_id})")
                             st.error(f"Could not build conditions for INSERT/UPDATE (log_id={log_id})")
-                            # Optionally: mark the log as needing manual intervention (not done here)
                             continue
 
                     elif action_upper == "DELETE":
                         if conditions:
                             session.sql(f"DELETE FROM {temp_table} WHERE {conditions}").collect()
-                            # optional: also delete from main table
+                            # optionally: delete from main table as well
                             # session.sql(f"DELETE FROM {table_name_db} WHERE {conditions}").collect()
                             approved_count += 1
                         else:
@@ -167,35 +174,30 @@ if st.button("Approve Selected Records"):
                             st.warning(f"Approved DELETE log but couldn't build delete condition for log_id={log_id}")
                             continue
                     else:
-                        # Unknown action — we've already approved the log row; inform user
+                        # Unknown action — we approved the log row but no DB op needed
                         approved_count += 1
-                        st.info(f"Log (log_id={log_id}) approved but no DB operation performed for action='{action_db}'.")
 
                 except Exception as e:
                     errors.append(f"Error processing log_id={log_id}: {e}")
                     st.error(f"Error processing log_id={log_id}: {e}")
                     continue
 
-            # end for each selected edited row
+            # end for each selected row
 
-            # Summary feedback
+            # Summary to user (no extra pending-preview)
             st.success(f"Approval run complete. Successfully applied {approved_count} row(s).")
             if errors:
-                st.warning("Some errors occurred during approval. See messages above for details.")
+                st.warning("Some errors occurred during approval. Check messages above.")
 
-            # Refresh pending logs and show updated count/preview
-            try:
-                refreshed_pending = session.sql(f"SELECT * FROM {log_table} WHERE approved = FALSE").to_pandas()
-            except Exception as e:
-                st.error(f"Could not refresh pending logs: {e}")
-                refreshed_pending = pd.DataFrame()
+            # ----------------- SHOW MAIN TABLES (REFRESHED) -----------------
+            # After approval finished, display main table(s) so users can see the newly inserted rows.
+            for key, info in main_tables.items():
+                main_table_name = info.get("name")
+                st.markdown(f"### Main table: {main_table_name}")
+                try:
+                    main_df = session.table(main_table_name).to_pandas()
+                    st.dataframe(main_df)
+                except Exception as e:
+                    st.error(f"Could not fetch main table {main_table_name}: {e}")
 
-            if refreshed_pending.empty:
-                st.success("No more pending approvals.")
-            else:
-                pending_count = len(refreshed_pending)
-                st.warning(f"Pending Approvals (refreshed): {pending_count} record(s) found.")
-                refreshed_pending.columns = [c.lower() for c in refreshed_pending.columns]
-                display_cols = [c for c in refreshed_pending.columns if c not in ["domain_id", "approved", "approved_by", "approved_at"]]
-                preview_df = refreshed_pending[display_cols].copy().reset_index(drop=True)
-                st.dataframe(preview_df.head(10))
+            # Do NOT display pending logs preview here (per your request)
