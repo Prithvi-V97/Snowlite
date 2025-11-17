@@ -8,53 +8,57 @@ import streamlit as st
 from datetime import datetime, date
 from snowflake.snowpark.context import get_active_session
 
-# =====================================================
-# App Title and Snowflake Session
-# =====================================================
-st.title("DDM Dual Table DML Dashboard (Final)")
+# Try import st-aggrid; if missing, we'll fall back to st.data_editor with a warning
+try:
+    from st_aggrid import AgGrid, GridOptionsBuilder, GridUpdateMode, DataReturnMode
+    AGGRID_AVAILABLE = True
+except Exception:
+    AGGRID_AVAILABLE = False
+
+# -------------------------
+# App title & session
+# -------------------------
+st.set_page_config(layout="wide")
+st.title("DDM Dual Table DML Dashboard (Final with Editable UI)")
 session = get_active_session()
 
-# Best-effort add openpyxl for Excel uploads
+# Try to add openpyxl for Excel uploads
 try:
     session.add_packages("openpyxl")
 except Exception:
     st.warning("Could not add openpyxl automatically. If Excel upload fails, use CSV instead.")
 
-# =====================================================
-# Table mappings
-# =====================================================
+# -------------------------
+# Table mappings (edit as needed)
+# -------------------------
 main_tables = {
     "DDM_DOMAIN_VALUE": {
-        "name": "OMNIDDM.COMMON.DDM_DOMAIN_VALUE",
-        "temp": "OMNIDDM.COMMON.DDM_DOMAIN_VALUE_TEMP",
-        "log": "OMNIDDM.COMMON.DDM_DOMAIN_VALUE_LOG",
+        "name": "OMNIDDM_TK270.COMMON.DDM_DOMAIN_VALUE",
+        "temp": "OMNIDDM_TK270.COMMON.DDM_DOMAIN_VALUE_TEMP",
+        "log": "OMNIDDM_TK270.COMMON.DDM_DOMAIN_VALUE_LOG",
         "required_cols": ["TARGETENTITY", "TARGETDOMAIN", "DOMAINVALUE", "DESCRIPTION"]
     },
     "DDM_XREF_DOMAIN_VALUE": {
-        "name": "OMNIDDM.COMMON.DDM_XREF_DOMAIN_VALUE",
-        "temp": "OMNIDDM.COMMON.DDM_XREF_DOMAIN_VALUE_TEMP",
-        "log": "OMNIDDM.COMMON.DDM_DOMAIN_VALUE_LOG",
-        "required_cols": ["SOURCEENTITY", "SOURCEDOMAIN", "TARGETENTITY", "TARGETDOMAIN", "XREFDOMAINVALUE"]
+        "name": "OMNIDDM_TK270.COMMON.DDM_XREF_DOMAIN_VALUE",
+        "temp": "OMNIDDM_TK270.COMMON.DDM_XREF_DOMAIN_VALUE_TEMP",
+        "log": "OMNIDDM_TK270.COMMON.DDM_XREF_DOMAIN_VALUE_LOG",
+        "required_cols": ["TARGETENTITY", "TARGETDOMAIN", "TARGETDOMAINVALUE", "FROMENTITY", "FROMDOMAIN", "FROMDOMAINVALUE"]
     }
 }
 
-LOG_TABLE = "OMNIDDM.COMMON.DDM_DOMAIN_VALUE_LOG"
-
-
-# =====================================================
+# -------------------------
 # Helpers
-# =====================================================
+# -------------------------
 def normalize_string(s):
-    """Replace NBSP with regular space and strip. Return same type for non-strings."""
+    """Replace NBSP with space and strip."""
     if s is None:
         return None
     if isinstance(s, str):
         return s.replace("\u00A0", " ").strip()
     return s
 
-
 def read_uploaded_file(uploaded_file):
-    """Read uploaded Excel/CSV and normalize string cells to remove NBSPs and trim."""
+    """Read uploaded Excel/CSV and normalize strings."""
     try:
         if uploaded_file.name.endswith(".xlsx"):
             df = pd.read_excel(uploaded_file, engine="openpyxl")
@@ -67,16 +71,14 @@ def read_uploaded_file(uploaded_file):
         else:
             st.error("Unsupported file format. Please upload .xlsx or .csv")
             return None
-        # Normalize all string cells to remove NBSP and trim
         df = df.applymap(lambda x: normalize_string(x) if isinstance(x, str) else x)
         return df
     except Exception as e:
         st.error("Error reading file: " + str(e))
         return None
 
-
 def clean_for_json(obj):
-    """Convert pandas / numpy types to JSON-serializable primitives."""
+    """Make Python objects JSON-friendly (handles NaT, numpy types, datetimes)."""
     if obj is None:
         return None
     try:
@@ -108,92 +110,65 @@ def clean_for_json(obj):
     except Exception:
         return None
 
+def find_log_table_for_main(table_name):
+    for info in main_tables.values():
+        if info["name"] == table_name:
+            return info["log"]
+    return None
 
-def log_change(table_name, action, old_value=None, new_value=None):
-    """Insert a JSON-cleaned row into the log table."""
+def log_change(main_table_name, action, old_value=None, new_value=None):
+    """Insert audit into corresponding log table for given main_table_name."""
+    log_table = find_log_table_for_main(main_table_name)
+    if not log_table:
+        raise ValueError("No log table mapping found for " + str(main_table_name))
     cleaned_old = clean_for_json(old_value) if old_value is not None else None
     cleaned_new = clean_for_json(new_value) if new_value is not None else None
-
     old_json = json.dumps(cleaned_old) if cleaned_old is not None else None
     new_json = json.dumps(cleaned_new) if cleaned_new is not None else None
-
     old_sql_val = "$$ " + old_json + " $$" if old_json is not None else "NULL"
     new_sql_val = "$$ " + new_json + " $$" if new_json is not None else "NULL"
-
     insert_sql = (
-        "INSERT INTO " + LOG_TABLE + " "
-        "(action, table_name, old_value, new_value, changed_by, changed_at, approved) "
-        "VALUES ("
-        "'" + str(action) + "', "
-        "'" + str(table_name) + "', "
-        + old_sql_val + ", "
-        + new_sql_val + ", "
-        "'streamlit_user', CURRENT_TIMESTAMP, FALSE)"
+        "INSERT INTO " + log_table + " (action, table_name, old_value, new_value, changed_by, changed_at, approved) VALUES ("
+        "'" + str(action) + "', '" + str(main_table_name) + "', " + old_sql_val + ", " + new_sql_val +
+        ", 'streamlit_user', CURRENT_TIMESTAMP, FALSE)"
     )
     session.sql(insert_sql).collect()
 
-
 def parse_new_value(val):
-    """
-    Robust parsing for JSON or Python-literal-like values stored in log.
-    Also normalizes string values: replaces NBSP with normal spaces and strips.
-    Returns a dict or raises ValueError.
-    """
+    """Parse JSON-like stored values into dicts; normalize strings inside."""
     if val is None:
-        raise ValueError("value is None")
+        return {}
     if isinstance(val, dict):
-        return {k: (v.replace('\u00A0', ' ').strip() if isinstance(v, str) else v) for k, v in val.items()}
-
-    try:
-        if isinstance(val, float) and pd.isna(val):
-            raise ValueError("value is NaN")
-    except Exception:
-        pass
-
+        return {k: (v.replace("\u00A0", " ").strip() if isinstance(v, str) else v) for k, v in val.items()}
     s = str(val).strip()
-    m = re.match(r'^\$\$(.*)\$\$$', s, flags=re.DOTALL)
-    if m:
-        s = m.group(1).strip()
-
-    # Try JSON first
+    if s.startswith("$$") and s.endswith("$$"):
+        s = s[2:-2].strip()
     try:
         parsed = json.loads(s)
         if isinstance(parsed, dict):
-            return {k: (v.replace('\u00A0', ' ').strip() if isinstance(v, str) else v) for k, v in parsed.items()}
+            return {k: (v.replace("\u00A0", " ").strip() if isinstance(v, str) else v) for k, v in parsed.items()}
     except Exception:
         pass
-
-    # Fix common single-quote/unquoted keys
-    s_fixed = re.sub(r'([{\[,]\s*)([A-Za-z_][A-Za-z0-9_]*)\s*:', r'\1"\2":', s)
-    s_fixed = s_fixed.replace("'", '"')
     try:
-        parsed = json.loads(s_fixed)
+        parsed = json.loads(s.replace("'", '"'))
         if isinstance(parsed, dict):
-            return {k: (v.replace('\u00A0', ' ').strip() if isinstance(v, str) else v) for k, v in parsed.items()}
+            return {k: (v.replace("\u00A0", " ").strip() if isinstance(v, str) else v) for k, v in parsed.items()}
     except Exception:
         pass
-
-    # Fallback to ast.literal_eval
     try:
         parsed = ast.literal_eval(s)
         if isinstance(parsed, dict):
-            return {k: (v.replace('\u00A0', ' ').strip() if isinstance(v, str) else v) for k, v in parsed.items()}
-        else:
-            raise ValueError("literal_eval did not yield dict")
-    except Exception as e:
-        raise ValueError("Could not parse value: " + str(e) + "; raw=" + repr(val))
-
+            return {k: (v.replace("\u00A0", " ").strip() if isinstance(v, str) else v) for k, v in parsed.items()}
+    except Exception:
+        pass
+    return {}
 
 def fetch_main_table_sorted(table_name):
-    """
-    Fetch the main table into a DataFrame.
-    Try to bring recently changed records to the top by checking common timestamp-like columns.
-    """
+    """Fetch main table and try to sort by a timestamp-like column so newest on top."""
     try:
         df = session.table(table_name).to_pandas()
     except Exception:
         return pd.DataFrame()
-
     ts_candidates = [c for c in df.columns if c.lower() in ("approved_at", "changed_at", "created_at", "updated_at", "load_ts")]
     if ts_candidates:
         ts_col = ts_candidates[0]
@@ -203,31 +178,518 @@ def fetch_main_table_sorted(table_name):
             return df
         except Exception:
             pass
-
     return df.reset_index(drop=True)
 
+def sql_literal(v):
+    """Return SQL literal or NULL for Python value v (safe quoting)."""
+    try:
+        if pd.isna(v):
+            return "NULL"
+    except Exception:
+        pass
+    if v is None:
+        return "NULL"
+    if isinstance(v, (int, float, np.integer, np.floating)) and not isinstance(v, (bool, np.bool_)):
+        return str(v)
+    s = str(v)
+    if re.fullmatch(r"-?\d+(\.\d+)?", s.strip()):
+        return s.strip()
+    return "'" + s.replace("'", "''") + "'"
 
-# =====================================================
-# Render table UI
-# =====================================================
+# -------------------------
+# Render per-table UI
+# -------------------------
 def render_table_ui(tab, table_key):
     info = main_tables[table_key]
     main_table = info["name"]
     temp_table = info["temp"]
+    log_table = info["log"]
     required_cols = info["required_cols"]
+    key_col = required_cols[-1]  # assume last required col is the row key
 
     with tab:
-        st.subheader("Main Table: " + main_table)
+        # -------------------------
+        # Approval Dashboard (per-table)
+        # -------------------------
+        st.markdown("## Approval Dashboard")
+        try:
+            logs = session.sql("SELECT * FROM " + log_table + " WHERE approved = FALSE").to_pandas()
+        except Exception as e:
+            st.error("Could not fetch pending logs: " + str(e))
+            logs = pd.DataFrame()
 
-        main_df = fetch_main_table_sorted(main_table)
-        if not main_df.empty:
-            st.dataframe(main_df)
+        pending_count = len(logs)
+        st.markdown(f"### Pending Logs for {table_key} ({pending_count})")
+
+        if logs.empty:
+            st.success("No pending approvals.")
         else:
+            logs.columns = [c.lower() for c in logs.columns]
+            display_cols = [c for c in logs.columns if c not in ["approved", "approved_by", "approved_at"]]
+            display_df = logs[display_cols].copy().reset_index(drop=True)
+
+            approve_key = f"approve_col_{table_key}"
+            if approve_key not in st.session_state or len(st.session_state[approve_key]) != len(display_df):
+                st.session_state[approve_key] = [False] * len(display_df)
+
+            if st.button("Select All Pending for Approval", key=f"select_all_{table_key}"):
+                st.session_state[approve_key] = [True] * len(display_df)
+
+            display_df["approve"] = st.session_state[approve_key]
+
+            # Make all columns except 'approve' read-only in the editor
+            column_config = {col: st.column_config.Column(disabled=True) for col in display_df.columns if col != "approve"}
+            column_config["approve"] = st.column_config.CheckboxColumn("Approve", help="Tick to approve this record", width=80)
+
+            edited_logs = st.data_editor(
+                display_df,
+                use_container_width=True,
+                height=300,
+                column_config=column_config,
+                hide_index=True,
+                key=f"data_editor_logs_{table_key}"
+            )
+
+            if "approve" in edited_logs.columns:
+                st.session_state[approve_key] = list(edited_logs["approve"])
+
+            # Approval handler (applies INSERT/UPDATE/DELETE to main table based on log)
+            if st.button(f"Approve Selected Records for {table_key}"):
+                try:
+                    logs_db = session.sql("SELECT * FROM " + log_table + " WHERE approved = FALSE").to_pandas()
+                except Exception as e:
+                    st.error("Could not fetch logs for approval: " + str(e))
+                    logs_db = pd.DataFrame()
+
+                if logs_db.empty:
+                    st.info("No pending logs found at approval time.")
+                else:
+                    logs_db.columns = [c.lower() for c in logs_db.columns]
+
+                    # map key -> list rows
+                    def db_row_key(r):
+                        t = r.get("table_name") if r.get("table_name") is not None else ""
+                        a = r.get("action") if r.get("action") is not None else ""
+                        cb = r.get("changed_by") if r.get("changed_by") is not None else ""
+                        ch = r.get("changed_at")
+                        try:
+                            ch_iso = ch.isoformat() if hasattr(ch, "isoformat") else str(ch)
+                        except Exception:
+                            ch_iso = str(ch)
+                        return (str(t), str(a), str(cb), str(ch_iso))
+
+                    db_key_map = {}
+                    for _, r in logs_db.iterrows():
+                        key = db_row_key(r)
+                        db_key_map.setdefault(key, []).append(r)
+
+                    to_approve = edited_logs[edited_logs["approve"] == True]
+                    if to_approve.empty:
+                        st.warning("No rows selected for approval.")
+                    else:
+                        processed = 0
+                        errors = []
+
+                        def build_where_from_dict(d):
+                            if not isinstance(d, dict) or not d:
+                                return None
+                            parts = []
+                            for k, v in d.items():
+                                col = str(k).upper()
+                                if v is None:
+                                    parts.append(col + " IS NULL")
+                                else:
+                                    if isinstance(v, str):
+                                        v = v.replace("\u00A0", " ").strip()
+                                    parts.append(col + " = " + sql_literal(v))
+                            return " AND ".join(parts) if parts else None
+
+                        def build_set_from_dict(d):
+                            if not isinstance(d, dict) or not d:
+                                return None
+                            parts = []
+                            for k, v in d.items():
+                                col = str(k).upper()
+                                if v is None:
+                                    parts.append(col + " = NULL")
+                                else:
+                                    if isinstance(v, str):
+                                        v = v.replace("\u00A0", " ").strip()
+                                    parts.append(col + " = " + sql_literal(v))
+                            return ", ".join(parts) if parts else None
+
+                        for _, edited_row in to_approve.iterrows():
+                            table_name = edited_row.get("table_name")
+                            action = edited_row.get("action")
+                            changed_by = edited_row.get("changed_by")
+                            changed_at = edited_row.get("changed_at")
+                            try:
+                                changed_at_iso = changed_at.isoformat() if hasattr(changed_at, "isoformat") else str(changed_at)
+                            except Exception:
+                                changed_at_iso = str(changed_at)
+                            lookup_key = (str(table_name), str(action), str(changed_by), str(changed_at_iso))
+
+                            matched = db_key_map.get(lookup_key)
+                            if not matched:
+                                msg = "No matching DB log found for selected row: " + str(lookup_key)
+                                errors.append(msg)
+                                st.warning(msg)
+                                continue
+
+                            db_row = matched.pop(0)
+                            log_id = db_row.get("log_id")
+                            new_value_db = db_row.get("new_value")
+                            old_value_db = db_row.get("old_value")
+                            table_name_db = db_row.get("table_name")
+                            action_db = db_row.get("action")
+
+                            # find main mapping
+                            main_info = None
+                            for k, inf in main_tables.items():
+                                if inf.get("name") == table_name_db:
+                                    main_info = inf
+                                    break
+                            if not main_info:
+                                msg = "No main mapping found for " + str(table_name_db) + " (log_id=" + str(log_id) + ")"
+                                errors.append(msg)
+                                st.error(msg)
+                                continue
+
+                            main_table_name = main_info.get("name")
+                            required_cols_local = main_info.get("required_cols")
+
+                            parsed_new = parse_new_value(new_value_db) if new_value_db is not None else {}
+                            parsed_old = parse_new_value(old_value_db) if old_value_db is not None else {}
+
+                            act = str(action_db).upper() if action_db is not None else "INSERT"
+
+                            try:
+                                if act == "INSERT":
+                                    vals_parts = []
+                                    for col in required_cols_local:
+                                        val = parsed_new.get(col) if isinstance(parsed_new, dict) else None
+                                        if val is None:
+                                            if isinstance(parsed_new, dict):
+                                                val = parsed_new.get(col.lower(), parsed_new.get(col.upper(), None))
+                                        if isinstance(val, str):
+                                            val = normalize_string(val)
+                                        if val is None or val == "":
+                                            vals_parts.append("NULL")
+                                        else:
+                                            vals_parts.append(sql_literal(val))
+                                    insert_sql = "INSERT INTO " + main_table_name + " (" + ", ".join(required_cols_local) + ") VALUES (" + ", ".join(vals_parts) + ")"
+                                    session.sql(insert_sql).collect()
+                                    processed += 1
+
+                                elif act == "UPDATE":
+                                    set_clause = build_set_from_dict(parsed_new)
+                                    where_clause = build_where_from_dict(parsed_old)
+                                    if set_clause and where_clause:
+                                        update_sql = "UPDATE " + main_table_name + " SET " + set_clause + " WHERE " + where_clause
+                                        session.sql(update_sql).collect()
+                                        processed += 1
+                                    else:
+                                        # fallback: insert as new row
+                                        vals_parts = []
+                                        for col in required_cols_local:
+                                            val = parsed_new.get(col) if isinstance(parsed_new, dict) else None
+                                            if val is None:
+                                                if isinstance(parsed_new, dict):
+                                                    val = parsed_new.get(col.lower(), parsed_new.get(col.upper(), None))
+                                            if isinstance(val, str):
+                                                val = normalize_string(val)
+                                            if val is None or val == "":
+                                                vals_parts.append("NULL")
+                                            else:
+                                                vals_parts.append(sql_literal(val))
+                                        insert_sql = "INSERT INTO " + main_table_name + " (" + ", ".join(required_cols_local) + ") VALUES (" + ", ".join(vals_parts) + ")"
+                                        session.sql(insert_sql).collect()
+                                        processed += 1
+
+                                elif act == "DELETE":
+                                    where_clause = build_where_from_dict(parsed_old)
+                                    if where_clause:
+                                        delete_sql = "DELETE FROM " + main_table_name + " WHERE " + where_clause
+                                        session.sql(delete_sql).collect()
+                                        processed += 1
+                                    else:
+                                        where_clause2 = build_where_from_dict(parsed_new)
+                                        if where_clause2:
+                                            session.sql("DELETE FROM " + main_table_name + " WHERE " + where_clause2).collect()
+                                            processed += 1
+                                        else:
+                                            msg = "Cannot determine WHERE clause for DELETE for log_id=" + str(log_id) + "; skipped."
+                                            errors.append(msg)
+                                            st.warning(msg)
+                                            continue
+                                else:
+                                    # unknown action: insert
+                                    vals_parts = []
+                                    for col in required_cols_local:
+                                        val = parsed_new.get(col) if isinstance(parsed_new, dict) else None
+                                        if val is None:
+                                            if isinstance(parsed_new, dict):
+                                                val = parsed_new.get(col.lower(), parsed_new.get(col.upper(), None))
+                                        if isinstance(val, str):
+                                            val = normalize_string(val)
+                                        if val is None or val == "":
+                                            vals_parts.append("NULL")
+                                        else:
+                                            vals_parts.append(sql_literal(val))
+                                    insert_sql = "INSERT INTO " + main_table_name + " (" + ", ".join(required_cols_local) + ") VALUES (" + ", ".join(vals_parts) + ")"
+                                    session.sql(insert_sql).collect()
+                                    processed += 1
+
+                                # mark log approved (prefer log_id if numeric)
+                                try:
+                                    if log_id is not None:
+                                        try:
+                                            lid = int(log_id)
+                                            session.sql("UPDATE " + log_table + " SET approved = TRUE, approved_by = 'business_user', approved_at = CURRENT_TIMESTAMP WHERE log_id = " + str(lid) + " AND approved = FALSE").collect()
+                                        except Exception:
+                                            session.sql("UPDATE " + log_table + " SET approved = TRUE, approved_by = 'business_user', approved_at = CURRENT_TIMESTAMP WHERE table_name = '" + str(table_name_db).replace(\"'\", \"''\") + \"' AND changed_at = '\" + str(db_row.get('changed_at')).replace(\"'\", \"''\") + \"'\").collect()
+                                    else:
+                                        session.sql("UPDATE " + log_table + " SET approved = TRUE, approved_by = 'business_user', approved_at = CURRENT_TIMESTAMP WHERE table_name = '" + str(table_name_db).replace(\"'\", \"''\") + \"' AND changed_at = '\" + str(db_row.get('changed_at')).replace(\"'\", \"''\") + \"'\").collect()
+                                except Exception as e:
+                                    errors.append("Could not mark log approved for log_id=" + str(log_id) + ": " + str(e))
+
+                            except Exception as e:
+                                errors.append("Error processing log_id=" + str(log_id) + ": " + str(e))
+                                st.error("Error processing log_id=" + str(log_id) + ": " + str(e))
+                                continue
+
+                        st.success("Approval run complete. Processed " + str(processed) + " item(s).")
+                        if errors:
+                            st.warning("Some items had issues; check messages above.")
+
+                        # refresh UI
+                        try:
+                            if hasattr(st, "experimental_rerun"):
+                                st.experimental_rerun()
+                            elif hasattr(st, "rerun"):
+                                st.rerun()
+                            else:
+                                import streamlit.components.v1 as components
+                                components.html("<script>window.location.reload()</script>", height=0)
+                        except Exception:
+                            import streamlit.components.v1 as components
+                            components.html("<script>window.location.reload()</script>", height=0)
+
+        # -------------------------
+        # Main Table Editable UI (st-aggrid if available; fallback to st.data_editor)
+        # -------------------------
+        st.markdown("---")
+        st.subheader("Main Table: " + main_table)
+        main_df = fetch_main_table_sorted(main_table)
+
+        if main_df.empty:
             st.info("Main table empty or could not be fetched.")
+        else:
+            st.markdown("**Tip:** Edit cells directly. Add rows using the grid controls. When finished click **Send Edits to Approval** to push changes to TEMP & LOG (main table will not change until approval).")
 
-        key_col = required_cols[-1]
+            if AGGRID_AVAILABLE:
+                # Build grid options and allow full editing and dynamic rows
+                gb = GridOptionsBuilder.from_dataframe(main_df)
+                gb.configure_default_column(editable=True, resizable=True, filter=True, sortable=True)
+                gb.configure_grid_options(domLayout='normal')
+                grid_opts = gb.build()
 
-        # ----------------- Upload Section -----------------
+                grid_resp = AgGrid(
+                    main_df,
+                    gridOptions=grid_opts,
+                    data_return_mode=DataReturnMode.FILTERED_AND_SORTED,
+                    update_mode=GridUpdateMode.MANUAL,
+                    fit_columns_on_grid_load=True,
+                    enable_enterprise_modules=False,
+                    allow_unsafe_jscode=False,
+                    theme="alpine",
+                    key=f"aggrid_main_{table_key}"
+                )
+                edited_data = pd.DataFrame(grid_resp["data"])
+            else:
+                st.warning("For a better editing experience install `st-aggrid` (`pip install st-aggrid`). Falling back to Streamlit's basic editor.")
+                edited_data = st.data_editor(
+                    main_df,
+                    use_container_width=True,
+                    num_rows="dynamic",
+                    key=f"data_editor_main_{table_key}"
+                )
+
+            # Button: send edits to approval
+            if st.button("Send Edits to Approval", key=f"send_edits_{table_key}"):
+                try:
+                    orig = main_df.copy()
+                    new = edited_data.copy()
+
+                    # normalize key values as strings for mapping
+                    if key_col in orig.columns and key_col in new.columns:
+                        orig[key_col] = orig[key_col].apply(lambda x: normalize_string(x) if isinstance(x, str) else x)
+                        new[key_col] = new[key_col].apply(lambda x: normalize_string(x) if isinstance(x, str) else x)
+
+                    # Build index maps
+                    orig_index = {}
+                    new_index = {}
+                    if key_col in orig.columns:
+                        for _, r in orig.iterrows():
+                            k = str(r[key_col])
+                            orig_index[k] = r
+                    if key_col in new.columns:
+                        for _, r in new.iterrows():
+                            k = str(r[key_col])
+                            new_index[k] = r
+
+                    # Detect deletes, inserts, updates
+                    deleted_keys = [k for k in orig_index.keys() if k not in new_index.keys()]
+                    inserted_keys = [k for k in new_index.keys() if (k not in orig_index.keys() or k == "" or k.lower() == "nan")]
+                    updated_keys = []
+                    for k in orig_index.keys():
+                        if k in new_index:
+                            o = orig_index[k]
+                            n = new_index[k]
+                            changed = False
+                            for c in orig.columns:
+                                o_val = o.get(c)
+                                n_val = n.get(c)
+                                if isinstance(o_val, str):
+                                    o_val = normalize_string(o_val)
+                                if isinstance(n_val, str):
+                                    n_val = normalize_string(n_val)
+                                try:
+                                    if pd.isna(o_val):
+                                        o_val = None
+                                except Exception:
+                                    pass
+                                try:
+                                    if pd.isna(n_val):
+                                        n_val = None
+                                except Exception:
+                                    pass
+                                if (o_val is None and n_val is None) or (o_val == n_val):
+                                    continue
+                                changed = True
+                                break
+                            if changed:
+                                updated_keys.append(k)
+
+                    total_actions = len(deleted_keys) + len(inserted_keys) + len(updated_keys)
+                    if total_actions == 0:
+                        st.info("No changes detected to send for approval.")
+                    else:
+                        # Process deletes
+                        for dk in deleted_keys:
+                            old_row = orig_index.get(dk)
+                            vals_list = []
+                            for col in required_cols:
+                                v = old_row.get(col) if old_row is not None else None
+                                if isinstance(v, str):
+                                    v = normalize_string(v)
+                                try:
+                                    if pd.isna(v):
+                                        v = None
+                                except Exception:
+                                    pass
+                                if v is None or v == "":
+                                    vals_list.append("NULL")
+                                else:
+                                    vals_list.append("'" + str(v).replace("'", "''") + "'")
+                            cols_sql = ", ".join(required_cols)
+                            vals_sql = ", ".join(vals_list)
+                            insert_temp_sql = "INSERT INTO " + temp_table + " (" + cols_sql + ") VALUES (" + vals_sql + ")"
+                            session.sql(insert_temp_sql).collect()
+                            log_change(main_table, "DELETE", old_row.to_dict() if hasattr(old_row, "to_dict") else old_row, None)
+
+                        # Process inserts
+                        for ik in inserted_keys:
+                            new_row = new_index.get(ik)
+                            vals_list = []
+                            for col in required_cols:
+                                v = new_row.get(col) if new_row is not None else None
+                                if isinstance(v, str):
+                                    v = normalize_string(v)
+                                try:
+                                    if pd.isna(v):
+                                        v = None
+                                except Exception:
+                                    pass
+                                if v is None or v == "":
+                                    vals_list.append("NULL")
+                                else:
+                                    vals_list.append("'" + str(v).replace("'", "''") + "'")
+                            cols_sql = ", ".join(required_cols)
+                            vals_sql = ", ".join(vals_list)
+                            insert_temp_sql = "INSERT INTO " + temp_table + " (" + cols_sql + ") VALUES (" + vals_sql + ")"
+                            session.sql(insert_temp_sql).collect()
+                            # log new_value as dict
+                            nv = new_row.to_dict() if hasattr(new_row, "to_dict") else new_row
+                            log_change(main_table, "INSERT", None, nv)
+
+                        # Process updates
+                        for uk in updated_keys:
+                            orig_row = orig_index.get(uk)
+                            new_row = new_index.get(uk)
+                            vals_list = []
+                            for col in required_cols:
+                                v = new_row.get(col) if new_row is not None else None
+                                if isinstance(v, str):
+                                    v = normalize_string(v)
+                                try:
+                                    if pd.isna(v):
+                                        v = None
+                                except Exception:
+                                    pass
+                                if v is None or v == "":
+                                    vals_list.append("NULL")
+                                else:
+                                    vals_list.append("'" + str(v).replace("'", "''") + "'")
+                            cols_sql = ", ".join(required_cols)
+                            vals_sql = ", ".join(vals_list)
+                            insert_temp_sql = "INSERT INTO " + temp_table + " (" + cols_sql + ") VALUES (" + vals_sql + ")"
+                            session.sql(insert_temp_sql).collect()
+                            # build old/new dicts and log
+                            old_d = {}
+                            new_d = {}
+                            for col in required_cols:
+                                o = orig_row.get(col) if orig_row is not None else None
+                                n = new_row.get(col) if new_row is not None else None
+                                if isinstance(o, str):
+                                    o = normalize_string(o)
+                                if isinstance(n, str):
+                                    n = normalize_string(n)
+                                try:
+                                    if pd.isna(o):
+                                        o = None
+                                except Exception:
+                                    pass
+                                try:
+                                    if pd.isna(n):
+                                        n = None
+                                except Exception:
+                                    pass
+                                old_d[col] = o
+                                new_d[col] = n
+                            log_change(main_table, "UPDATE", old_d, new_d)
+
+                        st.success(f"Sent {total_actions} edit(s) to TEMP and logged for approval.")
+                        # refresh UI (main remains unchanged until approval)
+                        try:
+                            if hasattr(st, "experimental_rerun"):
+                                st.experimental_rerun()
+                            elif hasattr(st, "rerun"):
+                                st.rerun()
+                            else:
+                                import streamlit.components.v1 as components
+                                components.html("<script>window.location.reload()</script>", height=0)
+                        except Exception:
+                            import streamlit.components.v1 as components
+                            components.html("<script>window.location.reload()</script>", height=0)
+
+                except Exception as e:
+                    st.error("Error processing edits for approval: " + str(e))
+
+        # -------------------------
+        # Upload / Manual Insert / Temp CRUD (unchanged)
+        # -------------------------
+        st.markdown("---")
         st.markdown("### Upload Excel or CSV (Inserts into TEMP Table)")
         uploaded_file = st.file_uploader("Upload for " + table_key, type=["xlsx", "csv"])
         if uploaded_file:
@@ -236,16 +698,14 @@ def render_table_ui(tab, table_key):
                 excel_df.columns = [col.strip().upper() for col in excel_df.columns]
                 required_cols_upper = [col.upper() for col in required_cols]
                 st.dataframe(excel_df.head())
-
                 if all(col in excel_df.columns for col in required_cols_upper):
                     if st.button("Upload to TEMP for " + table_key):
                         inserted = 0
                         for _, row in excel_df.iterrows():
-                            cols = ", ".join(required_cols_upper)
+                            cols_sql = ", ".join(required_cols_upper)
                             vals_list = []
                             for col in required_cols_upper:
                                 v = row.get(col, "")
-                                # Normalize strings
                                 if isinstance(v, str):
                                     v = normalize_string(v)
                                 try:
@@ -258,8 +718,8 @@ def render_table_ui(tab, table_key):
                                 else:
                                     sval = str(v).replace("'", "''")
                                     vals_list.append("'" + sval + "'")
-                            vals = ", ".join(vals_list)
-                            insert_sql = "INSERT INTO " + temp_table + " (" + cols + ") VALUES (" + vals + ")"
+                            vals_sql = ", ".join(vals_list)
+                            insert_sql = "INSERT INTO " + temp_table + " (" + cols_sql + ") VALUES (" + vals_sql + ")"
                             session.sql(insert_sql).collect()
                             row_dict = {c: clean_for_json(normalize_string(row.get(c)) if isinstance(row.get(c), str) else row.get(c)) for c in required_cols_upper}
                             log_change(main_table, "INSERT", None, row_dict)
@@ -268,13 +728,12 @@ def render_table_ui(tab, table_key):
                 else:
                     st.error("Missing columns. Required: " + str(required_cols))
 
-        # ----------------- Manual Insert -----------------
         st.subheader("Manual Insert into TEMP Table")
-        with st.form("insert_form" + table_key):
+        with st.form("insert_form_" + table_key):
             inputs = {col: st.text_input(col) for col in required_cols}
             submit = st.form_submit_button("Insert Record")
             if submit:
-                cols = ", ".join(inputs.keys())
+                cols_sql = ", ".join(inputs.keys())
                 cleaned_vals = []
                 for v in inputs.values():
                     if isinstance(v, str):
@@ -283,13 +742,12 @@ def render_table_ui(tab, table_key):
                         cleaned_vals.append("NULL")
                     else:
                         cleaned_vals.append("'" + str(v).replace("'", "''") + "'")
-                vals = ", ".join(cleaned_vals)
-                insert_sql = "INSERT INTO " + temp_table + " (" + cols + ") VALUES (" + vals + ")"
+                vals_sql = ", ".join(cleaned_vals)
+                insert_sql = "INSERT INTO " + temp_table + " (" + cols_sql + ") VALUES (" + vals_sql + ")"
                 session.sql(insert_sql).collect()
                 log_change(main_table, "INSERT", None, {k: normalize_string(v) if isinstance(v, str) else v for k, v in inputs.items()})
                 st.success("Record inserted into TEMP and logged.")
 
-        # ----------------- Update (TEMP) -----------------
         st.subheader("Update Record (in TEMP Table)")
         with st.form("update_form_" + table_key):
             upd_key = st.text_input(key_col + " to Update")
@@ -313,7 +771,6 @@ def render_table_ui(tab, table_key):
                 log_change(main_table, "UPDATE", {upd_col: old_val}, {upd_col: new_value})
                 st.success("Record updated in TEMP and logged.")
 
-        # ----------------- Delete (TEMP) -----------------
         st.subheader("Delete Record (from TEMP Table)")
         with st.form("delete_form_" + table_key):
             del_key = st.text_input(key_col + " to Delete")
@@ -333,347 +790,9 @@ def render_table_ui(tab, table_key):
             elif submit_del:
                 st.warning("Please confirm delete before proceeding.")
 
-
-# =====================================================
-# Approval Dashboard
-# =====================================================
-st.markdown("## Approval Dashboard")
-
-try:
-    pending_logs = session.sql("SELECT * FROM " + LOG_TABLE + " WHERE approved = FALSE").to_pandas()
-except Exception as e:
-    st.error("Could not fetch pending logs: " + str(e))
-    pending_logs = pd.DataFrame()
-
-# Show pending count
-total_pending = len(pending_logs)
-st.markdown(f"### Pending Records for Approval: **{total_pending}**")
-
-if pending_logs.empty:
-    st.success("No pending approvals.")
-else:
-    pending_logs.columns = [c.lower() for c in pending_logs.columns]
-    display_cols = [c for c in pending_logs.columns if c not in ["approved", "approved_by", "approved_at"]]
-    display_df = pending_logs[display_cols].copy().reset_index(drop=True)
-    if "approve" not in display_df.columns:
-        display_df["approve"] = False
-
-    edited_df = st.data_editor(
-        display_df,
-        use_container_width=True,
-        height=400,
-        column_config={
-            "approve": st.column_config.CheckboxColumn(
-                "Approve",
-                help="Tick to approve this record",
-                width=80
-            )
-        },
-        hide_index=True
-    )
-
-    # -------------------------
-    # APPROVAL HANDLER (fixed for INSERT/UPDATE/DELETE)
-    # -------------------------
-    if st.button("Approve Selected Records"):
-        # re-fetch authoritative pending logs from DB
-        try:
-            pending_logs_db = session.sql("SELECT * FROM " + LOG_TABLE + " WHERE approved = FALSE").to_pandas()
-        except Exception as e:
-            st.error("Could not fetch pending logs for approval: " + str(e))
-            pending_logs_db = pd.DataFrame()
-
-        if pending_logs_db.empty:
-            st.info("No pending logs found in DB at approval time.")
-        else:
-            pending_logs_db.columns = [c.lower() for c in pending_logs_db.columns]
-
-            # build map keyed by (table_name, action, changed_by, changed_at_iso)
-            def db_row_key(r):
-                t = r.get("table_name") if r.get("table_name") is not None else ""
-                a = r.get("action") if r.get("action") is not None else ""
-                cb = r.get("changed_by") if r.get("changed_by") is not None else ""
-                ch = r.get("changed_at")
-                try:
-                    ch_iso = ch.isoformat() if hasattr(ch, "isoformat") else str(ch)
-                except Exception:
-                    ch_iso = str(ch)
-                return (str(t), str(a), str(cb), str(ch_iso))
-
-            db_key_map = {}
-            for _, r in pending_logs_db.iterrows():
-                key = db_row_key(r)
-                db_key_map.setdefault(key, []).append(r)
-
-            to_approve = edited_df[edited_df["approve"] == True]
-            if to_approve.empty:
-                st.warning("No rows selected for approval.")
-            else:
-                processed = 0
-                errors = []
-
-                # helper to produce SQL literal or NULL
-                def sql_literal(v):
-                    try:
-                        if pd.isna(v):
-                            return "NULL"
-                    except Exception:
-                        pass
-                    if v is None:
-                        return "NULL"
-                    if isinstance(v, (int, float, np.integer, np.floating)) and not isinstance(v, (bool, np.bool_)):
-                        return str(v)
-                    s = str(v)
-                    if re.fullmatch(r"-?\d+(\.\d+)?", s.strip()):
-                        return s.strip()
-                    return "'" + s.replace("'", "''") + "'"
-
-                # build WHERE/SET from dict helpers
-                def build_where_from_dict(d):
-                    if not isinstance(d, dict) or not d:
-                        return None
-                    parts = []
-                    for k, v in d.items():
-                        col = str(k).upper()
-                        if v is None:
-                            parts.append(col + " IS NULL")
-                        else:
-                            if isinstance(v, str):
-                                v = v.replace("\u00A0", " ").strip()
-                            parts.append(col + " = " + sql_literal(v))
-                    return " AND ".join(parts) if parts else None
-
-                def build_set_from_dict(d):
-                    if not isinstance(d, dict) or not d:
-                        return None
-                    parts = []
-                    for k, v in d.items():
-                        col = str(k).upper()
-                        if v is None:
-                            parts.append(col + " = NULL")
-                        else:
-                            if isinstance(v, str):
-                                v = v.replace("\u00A0", " ").strip()
-                            parts.append(col + " = " + sql_literal(v))
-                    return ", ".join(parts) if parts else None
-
-                for _, edited_row in to_approve.iterrows():
-                    table_name = edited_row.get("table_name")
-                    action = edited_row.get("action")
-                    changed_by = edited_row.get("changed_by")
-                    changed_at = edited_row.get("changed_at")
-                    try:
-                        changed_at_iso = changed_at.isoformat() if hasattr(changed_at, "isoformat") else str(changed_at)
-                    except Exception:
-                        changed_at_iso = str(changed_at)
-                    lookup_key = (str(table_name), str(action), str(changed_by), str(changed_at_iso))
-
-                    matched = db_key_map.get(lookup_key)
-                    if not matched:
-                        msg = "No matching DB log found for selected row: " + str(lookup_key)
-                        errors.append(msg)
-                        st.warning(msg)
-                        continue
-
-                    db_row = matched.pop(0)
-                    log_id = db_row.get("log_id")
-                    new_value_db = db_row.get("new_value")
-                    old_value_db = db_row.get("old_value")
-                    table_name_db = db_row.get("table_name")
-                    action_db = db_row.get("action")
-
-                    # find main table mapping for the log's table_name_db
-                    main_info = None
-                    for k, info in main_tables.items():
-                        if info.get("name") == table_name_db:
-                            main_info = info
-                            break
-                    if not main_info:
-                        msg = "No main mapping found for " + str(table_name_db) + " (log_id=" + str(log_id) + ")"
-                        errors.append(msg)
-                        st.error(msg)
-                        continue
-
-                    main_table_name = main_info.get("name")
-                    required_cols = main_info.get("required_cols")
-
-                    # parse new/old values into dicts (best-effort)
-                    parsed_new = {}
-                    parsed_old = {}
-
-                    try:
-                        if isinstance(new_value_db, dict):
-                            parsed_new = new_value_db
-                        elif new_value_db is not None:
-                            s = str(new_value_db).strip()
-                            if s.startswith("$$") and s.endswith("$$"):
-                                s = s[2:-2].strip()
-                            try:
-                                parsed_new = json.loads(s)
-                            except Exception:
-                                try:
-                                    parsed_new = json.loads(s.replace("'", '"'))
-                                except Exception:
-                                    try:
-                                        parsed_new = ast.literal_eval(s)
-                                    except Exception:
-                                        parsed_new = {}
-                    except Exception:
-                        parsed_new = {}
-
-                    try:
-                        if isinstance(old_value_db, dict):
-                            parsed_old = old_value_db
-                        elif old_value_db is not None:
-                            s2 = str(old_value_db).strip()
-                            if s2.startswith("$$") and s2.endswith("$$"):
-                                s2 = s2[2:-2].strip()
-                            try:
-                                parsed_old = json.loads(s2)
-                            except Exception:
-                                try:
-                                    parsed_old = json.loads(s2.replace("'", '"'))
-                                except Exception:
-                                    try:
-                                        parsed_old = ast.literal_eval(s2)
-                                    except Exception:
-                                        parsed_old = {}
-                    except Exception:
-                        parsed_old = {}
-
-                    act = str(action_db).upper() if action_db is not None else "INSERT"
-
-                    try:
-                        if act == "INSERT":
-                            # Insert new row using parsed_new; fallback to inserting NULLs for required_cols if missing
-                            vals_parts = []
-                            for col in required_cols:
-                                val = None
-                                if isinstance(parsed_new, dict):
-                                    if col in parsed_new:
-                                        val = parsed_new.get(col)
-                                    elif col.lower() in parsed_new:
-                                        val = parsed_new.get(col.lower())
-                                    elif col.upper() in parsed_new:
-                                        val = parsed_new.get(col.upper())
-                                if isinstance(val, str):
-                                    val = normalize_string(val)
-                                if val is None or val == "":
-                                    vals_parts.append("NULL")
-                                else:
-                                    vals_parts.append(sql_literal(val))
-                            insert_sql = "INSERT INTO " + main_table_name + " (" + ", ".join(required_cols) + ") VALUES (" + ", ".join(vals_parts) + ")"
-                            session.sql(insert_sql).collect()
-                            processed += 1
-
-                        elif act == "UPDATE":
-                            set_clause = build_set_from_dict(parsed_new)
-                            where_clause = build_where_from_dict(parsed_old)
-                            if set_clause and where_clause:
-                                update_sql = "UPDATE " + main_table_name + " SET " + set_clause + " WHERE " + where_clause
-                                session.sql(update_sql).collect()
-                                processed += 1
-                            else:
-                                # fallback: insert new row if we cannot reliably identify which main row to update
-                                vals_parts = []
-                                for col in required_cols:
-                                    val = None
-                                    if isinstance(parsed_new, dict):
-                                        if col in parsed_new:
-                                            val = parsed_new.get(col)
-                                        elif col.lower() in parsed_new:
-                                            val = parsed_new.get(col.lower())
-                                        elif col.upper() in parsed_new:
-                                            val = parsed_new.get(col.upper())
-                                    if isinstance(val, str):
-                                        val = normalize_string(val)
-                                    if val is None or val == "":
-                                        vals_parts.append("NULL")
-                                    else:
-                                        vals_parts.append(sql_literal(val))
-                                insert_sql = "INSERT INTO " + main_table_name + " (" + ", ".join(required_cols) + ") VALUES (" + ", ".join(vals_parts) + ")"
-                                session.sql(insert_sql).collect()
-                                processed += 1
-
-                        elif act == "DELETE":
-                            where_clause = build_where_from_dict(parsed_old)
-                            if where_clause:
-                                delete_sql = "DELETE FROM " + main_table_name + " WHERE " + where_clause
-                                session.sql(delete_sql).collect()
-                                processed += 1
-                            else:
-                                where_clause2 = build_where_from_dict(parsed_new)
-                                if where_clause2:
-                                    session.sql("DELETE FROM " + main_table_name + " WHERE " + where_clause2).collect()
-                                    processed += 1
-                                else:
-                                    msg = "Cannot determine WHERE clause for DELETE for log_id=" + str(log_id) + "; skipped."
-                                    errors.append(msg)
-                                    st.warning(msg)
-                                    continue
-                        else:
-                            # unknown action: insert as fallback
-                            vals_parts = []
-                            for col in required_cols:
-                                val = None
-                                if isinstance(parsed_new, dict):
-                                    if col in parsed_new:
-                                        val = parsed_new.get(col)
-                                    elif col.lower() in parsed_new:
-                                        val = parsed_new.get(col.lower())
-                                    elif col.upper() in parsed_new:
-                                        val = parsed_new.get(col.upper())
-                                if isinstance(val, str):
-                                    val = normalize_string(val)
-                                if val is None or val == "":
-                                    vals_parts.append("NULL")
-                                else:
-                                    vals_parts.append(sql_literal(val))
-                            insert_sql = "INSERT INTO " + main_table_name + " (" + ", ".join(required_cols) + ") VALUES (" + ", ".join(vals_parts) + ")"
-                            session.sql(insert_sql).collect()
-                            processed += 1
-
-                        # mark the log approved (prefer log_id)
-                        try:
-                            if log_id is not None:
-                                try:
-                                    lid = int(log_id)
-                                    session.sql("UPDATE " + LOG_TABLE + " SET approved = TRUE, approved_by = 'business_user', approved_at = CURRENT_TIMESTAMP WHERE log_id = " + str(lid) + " AND approved = FALSE").collect()
-                                except Exception:
-                                    # fallback textual where
-                                    session.sql("UPDATE " + LOG_TABLE + " SET approved = TRUE, approved_by = 'business_user', approved_at = CURRENT_TIMESTAMP WHERE table_name = '" + str(table_name_db).replace("'", "''") + "' AND changed_at = '" + str(db_row.get('changed_at')).replace("'", "''") + "'").collect()
-                            else:
-                                session.sql("UPDATE " + LOG_TABLE + " SET approved = TRUE, approved_by = 'business_user', approved_at = CURRENT_TIMESTAMP WHERE table_name = '" + str(table_name_db).replace("'", "''") + "' AND changed_at = '" + str(db_row.get('changed_at')).replace("'", "''") + "'").collect()
-                        except Exception as e:
-                            errors.append("Could not mark log approved for log_id=" + str(log_id) + ": " + str(e))
-
-                    except Exception as e:
-                        errors.append("Error processing log_id=" + str(log_id) + ": " + str(e))
-                        st.error("Error processing log_id=" + str(log_id) + ": " + str(e))
-                        continue
-
-                # End for selected rows
-
-                st.success("Approval run complete. Processed " + str(processed) + " item(s).")
-                if errors:
-                    st.warning("Some items had issues; check messages above.")
-
-                # Refresh UI safely
-                try:
-                    if hasattr(st, "experimental_rerun"):
-                        st.experimental_rerun()
-                    elif hasattr(st, "rerun"):
-                        st.rerun()
-                    else:
-                        import streamlit.components.v1 as components
-                        components.html("<script>window.location.reload()</script>", height=0)
-                except Exception:
-                    import streamlit.components.v1 as components
-                    components.html("<script>window.location.reload()</script>", height=0)
-
-# =====================================================
-# Tabs for Main Tables
-# =====================================================
+# -------------------------
+# Tabs
+# -------------------------
 tab1, tab2 = st.tabs(["DDM_DOMAIN_VALUE", "DDM_XREF_DOMAIN_VALUE"])
 render_table_ui(tab1, "DDM_DOMAIN_VALUE")
 render_table_ui(tab2, "DDM_XREF_DOMAIN_VALUE")
