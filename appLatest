@@ -8,7 +8,7 @@ import streamlit as st
 from datetime import datetime, date
 from snowflake.snowpark.context import get_active_session
 
-# Try import st-aggrid; if missing, we'll fall back to st.data_editor with a warning
+# Optional: st-aggrid for better editing experience
 try:
     from st_aggrid import AgGrid, GridOptionsBuilder, GridUpdateMode, DataReturnMode
     AGGRID_AVAILABLE = True
@@ -16,13 +16,13 @@ except Exception:
     AGGRID_AVAILABLE = False
 
 # -------------------------
-# App title & session
+# App config & Snowflake session
 # -------------------------
 st.set_page_config(layout="wide")
-st.title("DDM Dual Table DML Dashboard (Final with Editable UI)")
+st.title("DDM Dual Table DML Dashboard (Final)")
 session = get_active_session()
 
-# Try to add openpyxl for Excel uploads
+# Try to add openpyxl for Excel uploads (best effort)
 try:
     session.add_packages("openpyxl")
 except Exception:
@@ -50,7 +50,7 @@ main_tables = {
 # Helpers
 # -------------------------
 def normalize_string(s):
-    """Replace NBSP with space and strip."""
+    """Replace NBSP with normal space and strip."""
     if s is None:
         return None
     if isinstance(s, str):
@@ -58,7 +58,7 @@ def normalize_string(s):
     return s
 
 def read_uploaded_file(uploaded_file):
-    """Read uploaded Excel/CSV and normalize strings."""
+    """Read uploaded Excel/CSV and normalize string cells."""
     try:
         if uploaded_file.name.endswith(".xlsx"):
             df = pd.read_excel(uploaded_file, engine="openpyxl")
@@ -78,7 +78,7 @@ def read_uploaded_file(uploaded_file):
         return None
 
 def clean_for_json(obj):
-    """Make Python objects JSON-friendly (handles NaT, numpy types, datetimes)."""
+    """Convert Python/pandas/numpy objects into JSON-serializable primitives."""
     if obj is None:
         return None
     try:
@@ -110,14 +110,14 @@ def clean_for_json(obj):
     except Exception:
         return None
 
-def find_log_table_for_main(table_name):
+def find_log_table_for_main(main_table_name):
     for info in main_tables.values():
-        if info["name"] == table_name:
+        if info["name"] == main_table_name:
             return info["log"]
     return None
 
 def log_change(main_table_name, action, old_value=None, new_value=None):
-    """Insert audit into corresponding log table for given main_table_name."""
+    """Write an audit record to the appropriate log table for the main table name."""
     log_table = find_log_table_for_main(main_table_name)
     if not log_table:
         raise ValueError("No log table mapping found for " + str(main_table_name))
@@ -128,14 +128,15 @@ def log_change(main_table_name, action, old_value=None, new_value=None):
     old_sql_val = "$$ " + old_json + " $$" if old_json is not None else "NULL"
     new_sql_val = "$$ " + new_json + " $$" if new_json is not None else "NULL"
     insert_sql = (
-        "INSERT INTO " + log_table + " (action, table_name, old_value, new_value, changed_by, changed_at, approved) VALUES ("
+        "INSERT INTO " + log_table +
+        " (action, table_name, old_value, new_value, changed_by, changed_at, approved) VALUES ("
         "'" + str(action) + "', '" + str(main_table_name) + "', " + old_sql_val + ", " + new_sql_val +
         ", 'streamlit_user', CURRENT_TIMESTAMP, FALSE)"
     )
     session.sql(insert_sql).collect()
 
 def parse_new_value(val):
-    """Parse JSON-like stored values into dicts; normalize strings inside."""
+    """Try multiple strategies to parse a JSON-like value stored in the log."""
     if val is None:
         return {}
     if isinstance(val, dict):
@@ -164,7 +165,7 @@ def parse_new_value(val):
     return {}
 
 def fetch_main_table_sorted(table_name):
-    """Fetch main table and try to sort by a timestamp-like column so newest on top."""
+    """Fetch a main table and attempt to sort by a timestamp-like column so newest rows appear on top."""
     try:
         df = session.table(table_name).to_pandas()
     except Exception:
@@ -181,7 +182,7 @@ def fetch_main_table_sorted(table_name):
     return df.reset_index(drop=True)
 
 def sql_literal(v):
-    """Return SQL literal or NULL for Python value v (safe quoting)."""
+    """Return a SQL-safe literal (or NULL) for value v."""
     try:
         if pd.isna(v):
             return "NULL"
@@ -197,7 +198,7 @@ def sql_literal(v):
     return "'" + s.replace("'", "''") + "'"
 
 # -------------------------
-# Render per-table UI
+# Per-table UI & logic
 # -------------------------
 def render_table_ui(tab, table_key):
     info = main_tables[table_key]
@@ -205,7 +206,7 @@ def render_table_ui(tab, table_key):
     temp_table = info["temp"]
     log_table = info["log"]
     required_cols = info["required_cols"]
-    key_col = required_cols[-1]  # assume last required col is the row key
+    key_col = required_cols[-1]  # assume last required column is the row key
 
     with tab:
         # -------------------------
@@ -237,7 +238,7 @@ def render_table_ui(tab, table_key):
 
             display_df["approve"] = st.session_state[approve_key]
 
-            # Make all columns except 'approve' read-only in the editor
+            # Make columns read-only except the approve checkbox
             column_config = {col: st.column_config.Column(disabled=True) for col in display_df.columns if col != "approve"}
             column_config["approve"] = st.column_config.CheckboxColumn("Approve", help="Tick to approve this record", width=80)
 
@@ -253,7 +254,7 @@ def render_table_ui(tab, table_key):
             if "approve" in edited_logs.columns:
                 st.session_state[approve_key] = list(edited_logs["approve"])
 
-            # Approval handler (applies INSERT/UPDATE/DELETE to main table based on log)
+            # Approval handler
             if st.button(f"Approve Selected Records for {table_key}"):
                 try:
                     logs_db = session.sql("SELECT * FROM " + log_table + " WHERE approved = FALSE").to_pandas()
@@ -266,7 +267,6 @@ def render_table_ui(tab, table_key):
                 else:
                     logs_db.columns = [c.lower() for c in logs_db.columns]
 
-                    # map key -> list rows
                     def db_row_key(r):
                         t = r.get("table_name") if r.get("table_name") is not None else ""
                         a = r.get("action") if r.get("action") is not None else ""
@@ -343,7 +343,7 @@ def render_table_ui(tab, table_key):
                             table_name_db = db_row.get("table_name")
                             action_db = db_row.get("action")
 
-                            # find main mapping
+                            # find mapping
                             main_info = None
                             for k, inf in main_tables.items():
                                 if inf.get("name") == table_name_db:
@@ -368,9 +368,8 @@ def render_table_ui(tab, table_key):
                                     vals_parts = []
                                     for col in required_cols_local:
                                         val = parsed_new.get(col) if isinstance(parsed_new, dict) else None
-                                        if val is None:
-                                            if isinstance(parsed_new, dict):
-                                                val = parsed_new.get(col.lower(), parsed_new.get(col.upper(), None))
+                                        if val is None and isinstance(parsed_new, dict):
+                                            val = parsed_new.get(col.lower(), parsed_new.get(col.upper(), None))
                                         if isinstance(val, str):
                                             val = normalize_string(val)
                                         if val is None or val == "":
@@ -389,13 +388,12 @@ def render_table_ui(tab, table_key):
                                         session.sql(update_sql).collect()
                                         processed += 1
                                     else:
-                                        # fallback: insert as new row
+                                        # fallback to insert
                                         vals_parts = []
                                         for col in required_cols_local:
                                             val = parsed_new.get(col) if isinstance(parsed_new, dict) else None
-                                            if val is None:
-                                                if isinstance(parsed_new, dict):
-                                                    val = parsed_new.get(col.lower(), parsed_new.get(col.upper(), None))
+                                            if val is None and isinstance(parsed_new, dict):
+                                                val = parsed_new.get(col.lower(), parsed_new.get(col.upper(), None))
                                             if isinstance(val, str):
                                                 val = normalize_string(val)
                                             if val is None or val == "":
@@ -427,9 +425,8 @@ def render_table_ui(tab, table_key):
                                     vals_parts = []
                                     for col in required_cols_local:
                                         val = parsed_new.get(col) if isinstance(parsed_new, dict) else None
-                                        if val is None:
-                                            if isinstance(parsed_new, dict):
-                                                val = parsed_new.get(col.lower(), parsed_new.get(col.upper(), None))
+                                        if val is None and isinstance(parsed_new, dict):
+                                            val = parsed_new.get(col.lower(), parsed_new.get(col.upper(), None))
                                         if isinstance(val, str):
                                             val = normalize_string(val)
                                         if val is None or val == "":
@@ -440,7 +437,7 @@ def render_table_ui(tab, table_key):
                                     session.sql(insert_sql).collect()
                                     processed += 1
 
-                                # mark log approved (prefer log_id if numeric)
+                                # mark log approved (prefer numeric log_id)
                                 try:
                                     if log_id is not None:
                                         try:
@@ -476,7 +473,7 @@ def render_table_ui(tab, table_key):
                             components.html("<script>window.location.reload()</script>", height=0)
 
         # -------------------------
-        # Main Table Editable UI (st-aggrid if available; fallback to st.data_editor)
+        # Main Table Editable UI with explicit "Enable/Disable Editing" button
         # -------------------------
         st.markdown("---")
         st.subheader("Main Table: " + main_table)
@@ -485,12 +482,28 @@ def render_table_ui(tab, table_key):
         if main_df.empty:
             st.info("Main table empty or could not be fetched.")
         else:
-            st.markdown("**Tip:** Edit cells directly. Add rows using the grid controls. When finished click **Send Edits to Approval** to push changes to TEMP & LOG (main table will not change until approval).")
+            st.markdown("**Tip:** Toggle edit mode to change cells. Click **Send Edits to Approval** to push edits to TEMP & LOG (main table unchanged until approval).")
 
+            # session state key to control editability per-table
+            edit_key = f"main_edit_enabled_{table_key}"
+            if edit_key not in st.session_state:
+                st.session_state[edit_key] = False
+
+            # Toggle button
+            toggle_label = "Disable Editing" if st.session_state[edit_key] else "Enable Editing"
+            if st.button(toggle_label, key=f"btn_edit_{table_key}"):
+                st.session_state[edit_key] = not st.session_state[edit_key]
+
+            # show current mode
+            if st.session_state[edit_key]:
+                st.success("Edit mode enabled — you can edit cells. Click the button again to disable editing.")
+            else:
+                st.info("Edit mode disabled — table is read-only. Click 'Enable Editing' to allow edits.")
+
+            # Render the table: editable only when edit mode is enabled
             if AGGRID_AVAILABLE:
-                # Build grid options and allow full editing and dynamic rows
                 gb = GridOptionsBuilder.from_dataframe(main_df)
-                gb.configure_default_column(editable=True, resizable=True, filter=True, sortable=True)
+                gb.configure_default_column(editable=bool(st.session_state[edit_key]), resizable=True, filter=True, sortable=True)
                 gb.configure_grid_options(domLayout='normal')
                 grid_opts = gb.build()
 
@@ -507,26 +520,34 @@ def render_table_ui(tab, table_key):
                 )
                 edited_data = pd.DataFrame(grid_resp["data"])
             else:
-                st.warning("For a better editing experience install `st-aggrid` (`pip install st-aggrid`). Falling back to Streamlit's basic editor.")
+                # fallback to st.data_editor; configure columns editable based on edit mode
+                column_config = {}
+                for c in main_df.columns:
+                    if st.session_state[edit_key]:
+                        column_config[c] = st.column_config.TextColumn(label=c, editable=True)
+                    else:
+                        column_config[c] = st.column_config.Column(disabled=True)
+
                 edited_data = st.data_editor(
                     main_df,
                     use_container_width=True,
                     num_rows="dynamic",
+                    column_config=column_config,
                     key=f"data_editor_main_{table_key}"
                 )
 
-            # Button: send edits to approval
+            # Button: Send Edits to Approval (existing logic)
             if st.button("Send Edits to Approval", key=f"send_edits_{table_key}"):
                 try:
                     orig = main_df.copy()
                     new = edited_data.copy()
 
-                    # normalize key values as strings for mapping
+                    # Normalize key column values for mapping
                     if key_col in orig.columns and key_col in new.columns:
                         orig[key_col] = orig[key_col].apply(lambda x: normalize_string(x) if isinstance(x, str) else x)
                         new[key_col] = new[key_col].apply(lambda x: normalize_string(x) if isinstance(x, str) else x)
 
-                    # Build index maps
+                    # Build index maps by key_col
                     orig_index = {}
                     new_index = {}
                     if key_col in orig.columns:
@@ -619,7 +640,6 @@ def render_table_ui(tab, table_key):
                             vals_sql = ", ".join(vals_list)
                             insert_temp_sql = "INSERT INTO " + temp_table + " (" + cols_sql + ") VALUES (" + vals_sql + ")"
                             session.sql(insert_temp_sql).collect()
-                            # log new_value as dict
                             nv = new_row.to_dict() if hasattr(new_row, "to_dict") else new_row
                             log_change(main_table, "INSERT", None, nv)
 
@@ -645,7 +665,7 @@ def render_table_ui(tab, table_key):
                             vals_sql = ", ".join(vals_list)
                             insert_temp_sql = "INSERT INTO " + temp_table + " (" + cols_sql + ") VALUES (" + vals_sql + ")"
                             session.sql(insert_temp_sql).collect()
-                            # build old/new dicts and log
+                            # build dicts for logging
                             old_d = {}
                             new_d = {}
                             for col in required_cols:
@@ -670,7 +690,7 @@ def render_table_ui(tab, table_key):
                             log_change(main_table, "UPDATE", old_d, new_d)
 
                         st.success(f"Sent {total_actions} edit(s) to TEMP and logged for approval.")
-                        # refresh UI (main remains unchanged until approval)
+                        # refresh UI so edited main view resets to authoritative main table (edits pending approval)
                         try:
                             if hasattr(st, "experimental_rerun"):
                                 st.experimental_rerun()
