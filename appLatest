@@ -35,13 +35,13 @@ main_tables = {
     "DDM_DOMAIN_VALUE": {
         "name": "OMNIDDM_TK270.COMMON.DDM_DOMAIN_VALUE",
         "temp": "OMNIDDM_TK270.COMMON.DDM_DOMAIN_VALUE_TEMP",
-        "log": "OMNIDDM_TK270.COMMON.DDM_DOMAIN_VALUE_LOG",
+        "log":  "OMNIDDM_TK270.COMMON.DDM_DOMAIN_VALUE_LOG",
         "required_cols": ["TARGETENTITY", "TARGETDOMAIN", "DOMAINVALUE", "DESCRIPTION"]
     },
     "DDM_XREF_DOMAIN_VALUE": {
         "name": "OMNIDDM_TK270.COMMON.DDM_XREF_DOMAIN_VALUE",
         "temp": "OMNIDDM_TK270.COMMON.DDM_XREF_DOMAIN_VALUE_TEMP",
-        "log": "OMNIDDM_TK270.COMMON.DDM_XREF_DOMAIN_VALUE_LOG",
+        "log":  "OMNIDDM_TK270.COMMON.DDM_XREF_DOMAIN_VALUE_LOG",
         "required_cols": ["TARGETENTITY", "TARGETDOMAIN", "TARGETDOMAINVALUE", "FROMENTITY", "FROMDOMAIN", "FROMDOMAINVALUE"]
     }
 }
@@ -58,7 +58,7 @@ def normalize_string(s):
     return s
 
 def read_uploaded_file(uploaded_file):
-    """Read uploaded Excel/CSV and normalize string cells."""
+    """Read uploaded Excel/CSV and normalize strings."""
     try:
         if uploaded_file.name.endswith(".xlsx"):
             df = pd.read_excel(uploaded_file, engine="openpyxl")
@@ -442,11 +442,25 @@ def render_table_ui(tab, table_key):
                                     if log_id is not None:
                                         try:
                                             lid = int(log_id)
-                                            session.sql("UPDATE " + log_table + " SET approved = TRUE, approved_by = 'business_user', approved_at = CURRENT_TIMESTAMP WHERE log_id = " + str(lid) + " AND approved = FALSE").collect()
+                                            session.sql(
+                                                "UPDATE " + log_table +
+                                                " SET approved = TRUE, approved_by = 'business_user', approved_at = CURRENT_TIMESTAMP "
+                                                "WHERE log_id = " + str(lid) + " AND approved = FALSE"
+                                            ).collect()
                                         except Exception:
-                                            session.sql("UPDATE " + log_table + " SET approved = TRUE, approved_by = 'business_user', approved_at = CURRENT_TIMESTAMP WHERE table_name = '" + str(table_name_db).replace(\"'\", \"''\") + \"' AND changed_at = '\" + str(db_row.get('changed_at')).replace(\"'\", \"''\") + \"'\").collect()
+                                            session.sql(
+                                                "UPDATE " + log_table +
+                                                " SET approved = TRUE, approved_by = 'business_user', approved_at = CURRENT_TIMESTAMP "
+                                                "WHERE table_name = '" + str(table_name_db).replace("'", "''") +
+                                                "' AND changed_at = '" + str(db_row.get('changed_at')).replace("'", "''") + "'"
+                                            ).collect()
                                     else:
-                                        session.sql("UPDATE " + log_table + " SET approved = TRUE, approved_by = 'business_user', approved_at = CURRENT_TIMESTAMP WHERE table_name = '" + str(table_name_db).replace(\"'\", \"''\") + \"' AND changed_at = '\" + str(db_row.get('changed_at')).replace(\"'\", \"''\") + \"'\").collect()
+                                        session.sql(
+                                            "UPDATE " + log_table +
+                                            " SET approved = TRUE, approved_by = 'business_user', approved_at = CURRENT_TIMESTAMP "
+                                            "WHERE table_name = '" + str(table_name_db).replace("'", "''") +
+                                            "' AND changed_at = '" + str(db_row.get('changed_at')).replace("'", "''") + "'"
+                                        ).collect()
                                 except Exception as e:
                                     errors.append("Could not mark log approved for log_id=" + str(log_id) + ": " + str(e))
 
