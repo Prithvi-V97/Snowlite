@@ -259,6 +259,43 @@ def get_row_key(row, key_cols):
                 pass
         return '' if v is None else str(v)
 
+def get_series_value(row, col):
+    """
+    Robustly fetch a column value from a pandas Series (row).
+    - tries row.get(col)
+    - falls back to case-insensitive match on index
+    - normalizes NBSP and strips strings
+    - converts pd.NA / np.nan to None
+    """
+    v = None
+    # try standard .get
+    try:
+        v = row.get(col)
+    except Exception:
+        v = None
+
+    # fallback case-insensitive lookup
+    if v is None and hasattr(row, "index"):
+        for colname in row.index:
+            try:
+                if str(colname).lower() == str(col).lower():
+                    v = row[colname]
+                    break
+            except Exception:
+                continue
+
+    # normalize strings and NaN -> None
+    if isinstance(v, str):
+        v = normalize_string(v)
+    else:
+        try:
+            if pd.isna(v):
+                v = None
+        except Exception:
+            pass
+
+    return v
+
 def build_where_from_key_inputs(key_cols, inputs_map):
     """
     Build a SQL WHERE clause from key inputs.
@@ -691,22 +728,8 @@ def render_table_ui(tab, table_key):
                             n = new_index[k]
                             changed = False
                             for c in orig.columns:
-                                o_val = o.get(c)
-                                n_val = n.get(c)
-                                if isinstance(o_val, str):
-                                    o_val = normalize_string(o_val)
-                                if isinstance(n_val, str):
-                                    n_val = normalize_string(n_val)
-                                try:
-                                    if pd.isna(o_val):
-                                        o_val = None
-                                except Exception:
-                                    pass
-                                try:
-                                    if pd.isna(n_val):
-                                        n_val = None
-                                except Exception:
-                                    pass
+                                o_val = get_series_value(o, c)
+                                n_val = get_series_value(n, c)
                                 if (o_val is None and n_val is None) or (o_val == n_val):
                                     continue
                                 changed = True
@@ -728,22 +751,7 @@ def render_table_ui(tab, table_key):
                         def non_key_signature(row):
                             sig = []
                             for col in non_key_cols:
-                                v = None
-                                try:
-                                    v = row.get(col)
-                                except Exception:
-                                    for colname in row.index:
-                                        if str(colname).lower() == str(col).lower():
-                                            v = row[colname]
-                                            break
-                                if isinstance(v, str):
-                                    v = normalize_string(v)
-                                else:
-                                    try:
-                                        if pd.isna(v):
-                                            v = None
-                                    except Exception:
-                                        pass
+                                v = get_series_value(row, col)
                                 sig.append('' if v is None else str(v))
                             return tuple(sig)
 
@@ -776,14 +784,7 @@ def render_table_ui(tab, table_key):
                             # Insert the new representation into TEMP
                             vals_list = []
                             for col in required_cols:
-                                v = new_row.get(col) if new_row is not None else None
-                                if isinstance(v, str):
-                                    v = normalize_string(v)
-                                try:
-                                    if pd.isna(v):
-                                        v = None
-                                except Exception:
-                                    pass
+                                v = get_series_value(new_row, col) if new_row is not None else None
                                 if v is None or v == "":
                                     vals_list.append("NULL")
                                 else:
@@ -796,22 +797,8 @@ def render_table_ui(tab, table_key):
                             old_d = {}
                             new_d = {}
                             for col in required_cols:
-                                o = orig_row.get(col) if orig_row is not None else None
-                                n = new_row.get(col) if new_row is not None else None
-                                if isinstance(o, str):
-                                    o = normalize_string(o)
-                                if isinstance(n, str):
-                                    n = normalize_string(n)
-                                try:
-                                    if pd.isna(o):
-                                        o = None
-                                except Exception:
-                                    pass
-                                try:
-                                    if pd.isna(n):
-                                        n = None
-                                except Exception:
-                                    pass
+                                o = get_series_value(orig_row, col) if orig_row is not None else None
+                                n = get_series_value(new_row, col) if new_row is not None else None
                                 old_d[col] = o
                                 new_d[col] = n
                             log_change(main_table, "UPDATE", old_d, new_d)
@@ -826,14 +813,7 @@ def render_table_ui(tab, table_key):
                             new_row = new_index.get(k)
                             vals_list = []
                             for col in required_cols:
-                                v = new_row.get(col) if new_row is not None else None
-                                if isinstance(v, str):
-                                    v = normalize_string(v)
-                                try:
-                                    if pd.isna(v):
-                                        v = None
-                                except Exception:
-                                    pass
+                                v = get_series_value(new_row, col) if new_row is not None else None
                                 if v is None or v == "":
                                     vals_list.append("NULL")
                                 else:
@@ -846,22 +826,8 @@ def render_table_ui(tab, table_key):
                             old_d = {}
                             new_d = {}
                             for col in required_cols:
-                                o = orig_row.get(col) if orig_row is not None else None
-                                n = new_row.get(col) if new_row is not None else None
-                                if isinstance(o, str):
-                                    o = normalize_string(o)
-                                if isinstance(n, str):
-                                    n = normalize_string(n)
-                                try:
-                                    if pd.isna(o):
-                                        o = None
-                                except Exception:
-                                    pass
-                                try:
-                                    if pd.isna(n):
-                                        n = None
-                                except Exception:
-                                    pass
+                                o = get_series_value(orig_row, col) if orig_row is not None else None
+                                n = get_series_value(new_row, col) if new_row is not None else None
                                 old_d[col] = o
                                 new_d[col] = n
                             log_change(main_table, "UPDATE", old_d, new_d)
@@ -875,14 +841,7 @@ def render_table_ui(tab, table_key):
                             new_row = new_index.get(ik)
                             vals_list = []
                             for col in required_cols:
-                                v = new_row.get(col) if new_row is not None else None
-                                if isinstance(v, str):
-                                    v = normalize_string(v)
-                                try:
-                                    if pd.isna(v):
-                                        v = None
-                                except Exception:
-                                    pass
+                                v = get_series_value(new_row, col) if new_row is not None else None
                                 if v is None or v == "":
                                     vals_list.append("NULL")
                                 else:
@@ -903,14 +862,7 @@ def render_table_ui(tab, table_key):
                             old_row = orig_index.get(dk)
                             vals_list = []
                             for col in required_cols:
-                                v = old_row.get(col) if old_row is not None else None
-                                if isinstance(v, str):
-                                    v = normalize_string(v)
-                                try:
-                                    if pd.isna(v):
-                                        v = None
-                                except Exception:
-                                    pass
+                                v = get_series_value(old_row, col) if old_row is not None else None
                                 if v is None or v == "":
                                     vals_list.append("NULL")
                                 else:
