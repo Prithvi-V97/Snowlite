@@ -45,7 +45,7 @@ main_tables = {
         "temp": "OMNIDDM_TK270.COMMON.DDM_XREF_DOMAIN_VALUE_TEMP",
         "log":  "OMNIDDM_TK270.COMMON.DDM_XREF_DOMAIN_VALUE_LOG",
         "required_cols": ["TARGETENTITY", "TARGETDOMAIN", "TARGETDOMAINVALUE", "FROMENTITY", "FROMDOMAIN", "FROMDOMAINVALUE"]
-        # no explicit key_col here — will default to last required_cols element (works for this table)
+        # no explicit key_col here — will default to last required_cols element
     }
 }
 
@@ -536,21 +536,28 @@ def render_table_ui(tab, table_key):
                 )
                 edited_data = pd.DataFrame(grid_resp["data"])
             else:
-                # fallback to st.data_editor; configure columns editable based on edit mode
+                # fallback to st.data_editor; configure columns editable based on edit mode (safe API)
                 column_config = {}
-                for c in main_df.columns:
-                    if st.session_state[edit_key]:
-                        column_config[c] = st.column_config.TextColumn(label=c, editable=True)
-                    else:
-                        column_config[c] = st.column_config.Column(disabled=True)
 
-                edited_data = st.data_editor(
-                    main_df,
-                    use_container_width=True,
-                    num_rows="dynamic",
-                    column_config=column_config,
-                    key=f"data_editor_main_{table_key}"
-                )
+                if not st.session_state[edit_key]:
+                    # edit mode is disabled → mark all columns readonly (disabled=True)
+                    for c in main_df.columns:
+                        column_config[c] = st.column_config.Column(disabled=True)
+                    edited_data = st.data_editor(
+                        main_df,
+                        use_container_width=True,
+                        num_rows="dynamic",
+                        column_config=column_config,
+                        key=f"data_editor_main_{table_key}"
+                    )
+                else:
+                    # edit mode is enabled → data_editor is editable by default (no editable flag)
+                    edited_data = st.data_editor(
+                        main_df,
+                        use_container_width=True,
+                        num_rows="dynamic",
+                        key=f"data_editor_main_{table_key}"
+                    )
 
             # Button: Send Edits to Approval (existing logic)
             if st.button("Send Edits to Approval", key=f"send_edits_{table_key}"):
