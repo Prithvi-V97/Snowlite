@@ -535,24 +535,34 @@ def render_table_ui(tab, table_key):
                                 try:
                                     if log_id is not None:
                                         try:
+                                            # try numeric log_id first
                                             lid = int(log_id)
-                                            session.sql(
+                                            sql_mark = (
                                                 "UPDATE " + log_table +
                                                 " SET approved = TRUE, approved_by = 'business_user', approved_at = CURRENT_TIMESTAMP "
                                                 "WHERE log_id = " + str(lid) + " AND approved = FALSE"
-                                            ).collect()
+                                            )
+                                            session.sql(sql_mark).collect()
                                         except Exception:
-                                            session.sql(
+                                            # fallback to matching by table_name + changed_at (escape single quotes)
+                                            table_name_esc = str(table_name_db).replace("'", "''")
+                                            changed_at_str = str(db_row.get('changed_at')).replace("'", "''")
+                                            sql_mark = (
                                                 "UPDATE " + log_table +
                                                 " SET approved = TRUE, approved_by = 'business_user', approved_at = CURRENT_TIMESTAMP "
-                                                "WHERE table_name = '" + str(table_name_db).replace(\"'\", \"''\") + \"' AND changed_at = '\" + str(db_row.get('changed_at')).replace(\"'\", \"''\") + \"'\"
-                                            ).collect()
+                                                "WHERE table_name = '" + table_name_esc + "' AND changed_at = '" + changed_at_str + "'"
+                                            )
+                                            session.sql(sql_mark).collect()
                                     else:
-                                        session.sql(
+                                        # no numeric log_id; match by table_name + changed_at
+                                        table_name_esc = str(table_name_db).replace("'", "''")
+                                        changed_at_str = str(db_row.get('changed_at')).replace("'", "''")
+                                        sql_mark = (
                                             "UPDATE " + log_table +
                                             " SET approved = TRUE, approved_by = 'business_user', approved_at = CURRENT_TIMESTAMP "
-                                            "WHERE table_name = '" + str(table_name_db).replace(\"'\", \"''\") + \"' AND changed_at = '\" + str(db_row.get('changed_at')).replace(\"'\", \"''\") + \"'\"
-                                        ).collect()
+                                            "WHERE table_name = '" + table_name_esc + "' AND changed_at = '" + changed_at_str + "'"
+                                        )
+                                        session.sql(sql_mark).collect()
                                 except Exception as e:
                                     errors.append("Could not mark log approved for log_id=" + str(log_id) + ": " + str(e))
 
