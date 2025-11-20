@@ -220,7 +220,6 @@ def get_row_key(row, key_cols):
                     if k in row:
                         v = row[k]
                     else:
-                        # try lower/upper variants
                         for colname in row.index:
                             if str(colname).lower() == str(k).lower():
                                 v = row[colname]
@@ -535,7 +534,6 @@ def render_table_ui(tab, table_key):
                                 try:
                                     if log_id is not None:
                                         try:
-                                            # try numeric log_id first
                                             lid = int(log_id)
                                             sql_mark = (
                                                 "UPDATE " + log_table +
@@ -544,7 +542,6 @@ def render_table_ui(tab, table_key):
                                             )
                                             session.sql(sql_mark).collect()
                                         except Exception:
-                                            # fallback to matching by table_name + changed_at (escape single quotes)
                                             table_name_esc = str(table_name_db).replace("'", "''")
                                             changed_at_str = str(db_row.get('changed_at')).replace("'", "''")
                                             sql_mark = (
@@ -554,7 +551,6 @@ def render_table_ui(tab, table_key):
                                             )
                                             session.sql(sql_mark).collect()
                                     else:
-                                        # no numeric log_id; match by table_name + changed_at
                                         table_name_esc = str(table_name_db).replace("'", "''")
                                         changed_at_str = str(db_row.get('changed_at')).replace("'", "''")
                                         sql_mark = (
@@ -677,8 +673,7 @@ def render_table_ui(tab, table_key):
                             k = get_row_key(r, key_cols)
                             new_index[k] = r
 
-                    # Detect deletes, inserts, updates
-                    deleted_keys = [k for k in orig_index.keys() if k not in new_index.keys()]
+                    # Helper to detect empty key (tuple or string)
                     def is_empty_key(k):
                         if isinstance(k, tuple):
                             return all((str(p) == "" or str(p).lower() == "nan") for p in k)
@@ -686,6 +681,8 @@ def render_table_ui(tab, table_key):
                             return (k == "" or k.lower() == "nan")
                         return False
 
+                    # Initial classification
+                    deleted_keys = [k for k in orig_index.keys() if k not in new_index.keys()]
                     inserted_keys = [k for k in new_index.keys() if (k not in orig_index.keys() or is_empty_key(k))]
                     updated_keys = []
                     for k in orig_index.keys():
@@ -717,36 +714,66 @@ def render_table_ui(tab, table_key):
                             if changed:
                                 updated_keys.append(k)
 
-                    total_actions = len(deleted_keys) + len(inserted_keys) + len(updated_keys)
-                    if total_actions == 0:
-                        st.info("No changes detected to send for approval.")
-                    else:
-                        # Process deletes
-                        for dk in deleted_keys:
-                            old_row = orig_index.get(dk)
-                            vals_list = []
-                            for col in required_cols:
-                                v = old_row.get(col) if old_row is not None else None
+                    # --- Pair deleted + inserted keys as updates when rows match on non-key columns ---
+                    paired_updates = []  # list of tuples (old_key, new_key)
+                    if deleted_keys and inserted_keys:
+                        # prepare list of non-key columns to compare
+                        non_key_cols = [c for c in orig.columns if (not (isinstance(key_cols, (list, tuple)) and c in key_cols) and not (isinstance(key_cols, str) and c == key_cols))]
+                        if not non_key_cols:
+                            if isinstance(key_cols, (list, tuple)):
+                                non_key_cols = [c for c in required_cols if c not in key_cols]
+                            else:
+                                non_key_cols = [c for c in required_cols if c != key_cols]
+
+                        def non_key_signature(row):
+                            sig = []
+                            for col in non_key_cols:
+                                v = None
+                                try:
+                                    v = row.get(col)
+                                except Exception:
+                                    for colname in row.index:
+                                        if str(colname).lower() == str(col).lower():
+                                            v = row[colname]
+                                            break
                                 if isinstance(v, str):
                                     v = normalize_string(v)
-                                try:
-                                    if pd.isna(v):
-                                        v = None
-                                except Exception:
-                                    pass
-                                if v is None or v == "":
-                                    vals_list.append("NULL")
                                 else:
-                                    vals_list.append("'" + str(v).replace("'", "''") + "'")
-                            cols_sql = ", ".join(required_cols)
-                            vals_sql = ", ".join(vals_list)
-                            insert_temp_sql = "INSERT INTO " + temp_table + " (" + cols_sql + ") VALUES (" + vals_sql + ")"
-                            session.sql(insert_temp_sql).collect()
-                            log_change(main_table, "DELETE", old_row.to_dict() if hasattr(old_row, "to_dict") else old_row, None)
+                                    try:
+                                        if pd.isna(v):
+                                            v = None
+                                    except Exception:
+                                        pass
+                                sig.append('' if v is None else str(v))
+                            return tuple(sig)
 
-                        # Process inserts
-                        for ik in inserted_keys:
-                            new_row = new_index.get(ik)
+                        deleted_sigs = {dk: non_key_signature(orig_index[dk]) for dk in deleted_keys}
+                        inserted_sigs = {ik: non_key_signature(new_index[ik]) for ik in inserted_keys}
+
+                        used_inserts = set()
+                        used_deletes = set()
+                        for dk, dsig in deleted_sigs.items():
+                            for ik, isig in inserted_sigs.items():
+                                if ik in used_inserts:
+                                    continue
+                                if dsig == isig:
+                                    paired_updates.append((dk, ik))
+                                    used_deletes.add(dk)
+                                    used_inserts.add(ik)
+                                    break
+
+                        deleted_keys = [k for k in deleted_keys if k not in used_deletes]
+                        inserted_keys = [k for k in inserted_keys if k not in used_inserts]
+
+                    processed = 0
+                    errors = []
+
+                    # Process paired updates first
+                    for old_k, new_k in paired_updates:
+                        try:
+                            orig_row = orig_index.get(old_k)
+                            new_row = new_index.get(new_k)
+                            # Insert the new representation into TEMP
                             vals_list = []
                             for col in required_cols:
                                 v = new_row.get(col) if new_row is not None else None
@@ -765,32 +792,7 @@ def render_table_ui(tab, table_key):
                             vals_sql = ", ".join(vals_list)
                             insert_temp_sql = "INSERT INTO " + temp_table + " (" + cols_sql + ") VALUES (" + vals_sql + ")"
                             session.sql(insert_temp_sql).collect()
-                            nv = new_row.to_dict() if hasattr(new_row, "to_dict") else new_row
-                            log_change(main_table, "INSERT", None, nv)
-
-                        # Process updates
-                        for uk in updated_keys:
-                            orig_row = orig_index.get(uk)
-                            new_row = new_index.get(uk)
-                            vals_list = []
-                            for col in required_cols:
-                                v = new_row.get(col) if new_row is not None else None
-                                if isinstance(v, str):
-                                    v = normalize_string(v)
-                                try:
-                                    if pd.isna(v):
-                                        v = None
-                                except Exception:
-                                    pass
-                                if v is None or v == "":
-                                    vals_list.append("NULL")
-                                else:
-                                    vals_list.append("'" + str(v).replace("'", "''") + "'")
-                            cols_sql = ", ".join(required_cols)
-                            vals_sql = ", ".join(vals_list)
-                            insert_temp_sql = "INSERT INTO " + temp_table + " (" + cols_sql + ") VALUES (" + vals_sql + ")"
-                            session.sql(insert_temp_sql).collect()
-                            # build dicts for logging
+                            # Log as UPDATE with old and new dicts
                             old_d = {}
                             new_d = {}
                             for col in required_cols:
@@ -813,20 +815,119 @@ def render_table_ui(tab, table_key):
                                 old_d[col] = o
                                 new_d[col] = n
                             log_change(main_table, "UPDATE", old_d, new_d)
+                            processed += 1
+                        except Exception as e:
+                            errors.append("Error processing paired update old_key=" + str(old_k) + " new_key=" + str(new_k) + ": " + str(e))
 
-                        st.success(f"Sent {total_actions} edit(s) to TEMP and logged for approval.")
-                        # refresh UI so edited main view resets to authoritative main table (edits pending approval)
+                    # Process unchanged-key updates
+                    for k in updated_keys:
                         try:
-                            if hasattr(st, "experimental_rerun"):
-                                st.experimental_rerun()
-                            elif hasattr(st, "rerun"):
-                                st.rerun()
-                            else:
-                                import streamlit.components.v1 as components
-                                components.html("<script>window.location.reload()</script>", height=0)
-                        except Exception:
-                            import streamlit.components.v1 as components
-                            components.html("<script>window.location.reload()</script>", height=0)
+                            orig_row = orig_index.get(k)
+                            new_row = new_index.get(k)
+                            vals_list = []
+                            for col in required_cols:
+                                v = new_row.get(col) if new_row is not None else None
+                                if isinstance(v, str):
+                                    v = normalize_string(v)
+                                try:
+                                    if pd.isna(v):
+                                        v = None
+                                except Exception:
+                                    pass
+                                if v is None or v == "":
+                                    vals_list.append("NULL")
+                                else:
+                                    vals_list.append("'" + str(v).replace("'", "''") + "'")
+                            cols_sql = ", ".join(required_cols)
+                            vals_sql = ", ".join(vals_list)
+                            insert_temp_sql = "INSERT INTO " + temp_table + " (" + cols_sql + ") VALUES (" + vals_sql + ")"
+                            session.sql(insert_temp_sql).collect()
+                            # build dicts and log UPDATE
+                            old_d = {}
+                            new_d = {}
+                            for col in required_cols:
+                                o = orig_row.get(col) if orig_row is not None else None
+                                n = new_row.get(col) if new_row is not None else None
+                                if isinstance(o, str):
+                                    o = normalize_string(o)
+                                if isinstance(n, str):
+                                    n = normalize_string(n)
+                                try:
+                                    if pd.isna(o):
+                                        o = None
+                                except Exception:
+                                    pass
+                                try:
+                                    if pd.isna(n):
+                                        n = None
+                                except Exception:
+                                    pass
+                                old_d[col] = o
+                                new_d[col] = n
+                            log_change(main_table, "UPDATE", old_d, new_d)
+                            processed += 1
+                        except Exception as e:
+                            errors.append("Error processing update key=" + str(k) + ": " + str(e))
+
+                    # Process pure inserts
+                    for ik in inserted_keys:
+                        try:
+                            new_row = new_index.get(ik)
+                            vals_list = []
+                            for col in required_cols:
+                                v = new_row.get(col) if new_row is not None else None
+                                if isinstance(v, str):
+                                    v = normalize_string(v)
+                                try:
+                                    if pd.isna(v):
+                                        v = None
+                                except Exception:
+                                    pass
+                                if v is None or v == "":
+                                    vals_list.append("NULL")
+                                else:
+                                    vals_list.append("'" + str(v).replace("'", "''") + "'")
+                            cols_sql = ", ".join(required_cols)
+                            vals_sql = ", ".join(vals_list)
+                            insert_temp_sql = "INSERT INTO " + temp_table + " (" + cols_sql + ") VALUES (" + vals_sql + ")"
+                            session.sql(insert_temp_sql).collect()
+                            nv = new_row.to_dict() if hasattr(new_row, "to_dict") else new_row
+                            log_change(main_table, "INSERT", None, nv)
+                            processed += 1
+                        except Exception as e:
+                            errors.append("Error processing insert key=" + str(ik) + ": " + str(e))
+
+                    # Process pure deletes
+                    for dk in deleted_keys:
+                        try:
+                            old_row = orig_index.get(dk)
+                            vals_list = []
+                            for col in required_cols:
+                                v = old_row.get(col) if old_row is not None else None
+                                if isinstance(v, str):
+                                    v = normalize_string(v)
+                                try:
+                                    if pd.isna(v):
+                                        v = None
+                                except Exception:
+                                    pass
+                                if v is None or v == "":
+                                    vals_list.append("NULL")
+                                else:
+                                    vals_list.append("'" + str(v).replace("'", "''") + "'")
+                            cols_sql = ", ".join(required_cols)
+                            vals_sql = ", ".join(vals_list)
+                            insert_temp_sql = "INSERT INTO " + temp_table + " (" + cols_sql + ") VALUES (" + vals_sql + ")"
+                            session.sql(insert_temp_sql).collect()
+                            log_change(main_table, "DELETE", old_row.to_dict() if hasattr(old_row, "to_dict") else old_row, None)
+                            processed += 1
+                        except Exception as e:
+                            errors.append("Error processing delete key=" + str(dk) + ": " + str(e))
+
+                    st.success("Sent edits to TEMP and logged for approval. Processed: " + str(processed))
+                    if errors:
+                        for er in errors:
+                            st.warning(er)
 
                 except Exception as e:
                     st.error("Error processing edits for approval: " + str(e))
