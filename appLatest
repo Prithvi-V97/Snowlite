@@ -30,7 +30,7 @@ except Exception:
 
 # -------------------------
 # Table mappings (edit as needed)
-# Note: added explicit key_col to avoid wrong key selection
+# Note: key_col can be a string or a list (composite key)
 # -------------------------
 main_tables = {
     "DDM_DOMAIN_VALUE": {
@@ -38,14 +38,15 @@ main_tables = {
         "temp": "OMNIDDM_TK270.COMMON.DDM_DOMAIN_VALUE_TEMP",
         "log":  "OMNIDDM_TK270.COMMON.DDM_DOMAIN_VALUE_LOG",
         "required_cols": ["TARGETENTITY", "TARGETDOMAIN", "DOMAINVALUE", "DESCRIPTION"],
-        "key_col": "DOMAINVALUE"   # explicit key column (fixes edit detection)
+        # composite key for uniqueness
+        "key_col": ["TARGETENTITY", "TARGETDOMAIN", "DOMAINVALUE"]
     },
     "DDM_XREF_DOMAIN_VALUE": {
         "name": "OMNIDDM_TK270.COMMON.DDM_XREF_DOMAIN_VALUE",
         "temp": "OMNIDDM_TK270.COMMON.DDM_XREF_DOMAIN_VALUE_TEMP",
         "log":  "OMNIDDM_TK270.COMMON.DDM_XREF_DOMAIN_VALUE_LOG",
         "required_cols": ["TARGETENTITY", "TARGETDOMAIN", "TARGETDOMAINVALUE", "FROMENTITY", "FROMDOMAIN", "FROMDOMAINVALUE"]
-        # no explicit key_col here — will default to last required_cols element
+        # key_col omitted -> will default to last required_cols element
     }
 }
 
@@ -200,6 +201,91 @@ def sql_literal(v):
         return s.strip()
     return "'" + s.replace("'", "''") + "'"
 
+def get_row_key(row, key_cols):
+    """
+    Return a stable key for a row:
+      - If key_cols is list/tuple: returns a tuple of normalized parts (hashable).
+      - If key_cols is str: returns a normalized string.
+    """
+    if isinstance(key_cols, (list, tuple)):
+        parts = []
+        for k in key_cols:
+            # row may be pandas Series; use .get if available
+            try:
+                v = row.get(k)
+            except Exception:
+                # fallback: try case-insensitive match
+                v = None
+                if hasattr(row, "__getitem__"):
+                    if k in row:
+                        v = row[k]
+                    else:
+                        # try lower/upper variants
+                        for colname in row.index:
+                            if str(colname).lower() == str(k).lower():
+                                v = row[colname]
+                                break
+            if isinstance(v, str):
+                v = normalize_string(v)
+            else:
+                try:
+                    if pd.isna(v):
+                        v = None
+                except Exception:
+                    pass
+            parts.append('' if v is None else str(v))
+        return tuple(parts)
+    else:
+        # single column
+        k = key_cols
+        try:
+            v = row.get(k)
+        except Exception:
+            v = None
+            if hasattr(row, "__getitem__"):
+                if k in row:
+                    v = row[k]
+                else:
+                    for colname in row.index:
+                        if str(colname).lower() == str(k).lower():
+                            v = row[colname]
+                            break
+        if isinstance(v, str):
+            v = normalize_string(v)
+        else:
+            try:
+                if pd.isna(v):
+                    v = None
+            except Exception:
+                pass
+        return '' if v is None else str(v)
+
+def build_where_from_key_inputs(key_cols, inputs_map):
+    """
+    Build a SQL WHERE clause from key inputs.
+    - key_cols: str or list
+    - inputs_map: dict mapping column -> user-provided value (already normalized strings or None)
+    Returns a WHERE clause string (without leading WHERE) or None if nothing provided.
+    """
+    parts = []
+    if isinstance(key_cols, (list, tuple)):
+        for kc in key_cols:
+            v = inputs_map.get(kc, None)
+            if v is None or v == "":
+                # match NULL or empty string (safe)
+                parts.append(f"({kc} IS NULL OR {kc} = '')")
+            else:
+                esc = str(v).replace("'", "''")
+                parts.append(f"{kc} = '{esc}'")
+    else:
+        v = inputs_map.get(key_cols, None)
+        if v is None or v == "":
+            parts.append(f"({key_cols} IS NULL OR {key_cols} = '')")
+        else:
+            esc = str(v).replace("'", "''")
+            parts.append(f"{key_cols} = '{esc}'")
+    return " AND ".join(parts) if parts else None
+
 # -------------------------
 # Per-table UI & logic
 # -------------------------
@@ -209,8 +295,12 @@ def render_table_ui(tab, table_key):
     temp_table = info["temp"]
     log_table = info["log"]
     required_cols = info["required_cols"]
-    # use explicit key_col if provided, otherwise fall back to last element
-    key_col = info.get("key_col", required_cols[-1])
+    key_cols = info.get("key_col", required_cols[-1])  # may be str or list
+    # display-friendly key label
+    if isinstance(key_cols, (list, tuple)):
+        key_label = ", ".join(key_cols)
+    else:
+        key_label = key_cols
 
     with tab:
         # -------------------------
@@ -455,13 +545,13 @@ def render_table_ui(tab, table_key):
                                             session.sql(
                                                 "UPDATE " + log_table +
                                                 " SET approved = TRUE, approved_by = 'business_user', approved_at = CURRENT_TIMESTAMP "
-                                                "WHERE table_name = '" + str(table_name_db).replace("'", "''") + "' AND changed_at = '" + str(db_row.get('changed_at')).replace("'", "''") + "'"
+                                                "WHERE table_name = '" + str(table_name_db).replace(\"'\", \"''\") + \"' AND changed_at = '\" + str(db_row.get('changed_at')).replace(\"'\", \"''\") + \"'\"
                                             ).collect()
                                     else:
                                         session.sql(
                                             "UPDATE " + log_table +
                                             " SET approved = TRUE, approved_by = 'business_user', approved_at = CURRENT_TIMESTAMP "
-                                            "WHERE table_name = '" + str(table_name_db).replace("'", "''") + "' AND changed_at = '" + str(db_row.get('changed_at')).replace("'", "''") + "'"
+                                            "WHERE table_name = '" + str(table_name_db).replace(\"'\", \"''\") + \"' AND changed_at = '\" + str(db_row.get('changed_at')).replace(\"'\", \"''\") + \"'\"
                                         ).collect()
                                 except Exception as e:
                                     errors.append("Could not mark log approved for log_id=" + str(log_id) + ": " + str(e))
@@ -538,7 +628,6 @@ def render_table_ui(tab, table_key):
             else:
                 # fallback to st.data_editor; configure columns editable based on edit mode (safe API)
                 column_config = {}
-
                 if not st.session_state[edit_key]:
                     # edit mode is disabled → mark all columns readonly (disabled=True)
                     for c in main_df.columns:
@@ -559,32 +648,35 @@ def render_table_ui(tab, table_key):
                         key=f"data_editor_main_{table_key}"
                     )
 
-            # Button: Send Edits to Approval (existing logic)
+            # Button: Send Edits to Approval (existing logic) — uses get_row_key for composite keys
             if st.button("Send Edits to Approval", key=f"send_edits_{table_key}"):
                 try:
                     orig = main_df.copy()
                     new = edited_data.copy()
 
-                    # Normalize key column values for mapping
-                    if key_col in orig.columns and key_col in new.columns:
-                        orig[key_col] = orig[key_col].apply(lambda x: normalize_string(x) if isinstance(x, str) else x)
-                        new[key_col] = new[key_col].apply(lambda x: normalize_string(x) if isinstance(x, str) else x)
-
-                    # Build index maps by key_col
+                    # Build index maps by composite or single key using get_row_key
                     orig_index = {}
                     new_index = {}
-                    if key_col in orig.columns:
+
+                    if not orig.empty:
                         for _, r in orig.iterrows():
-                            k = str(r[key_col])
+                            k = get_row_key(r, key_cols)
                             orig_index[k] = r
-                    if key_col in new.columns:
+                    if not new.empty:
                         for _, r in new.iterrows():
-                            k = str(r[key_col])
+                            k = get_row_key(r, key_cols)
                             new_index[k] = r
 
                     # Detect deletes, inserts, updates
                     deleted_keys = [k for k in orig_index.keys() if k not in new_index.keys()]
-                    inserted_keys = [k for k in new_index.keys() if (k not in orig_index.keys() or k == "" or k.lower() == "nan")]
+                    def is_empty_key(k):
+                        if isinstance(k, tuple):
+                            return all((str(p) == "" or str(p).lower() == "nan") for p in k)
+                        if isinstance(k, str):
+                            return (k == "" or k.lower() == "nan")
+                        return False
+
+                    inserted_keys = [k for k in new_index.keys() if (k not in orig_index.keys() or is_empty_key(k))]
                     updated_keys = []
                     for k in orig_index.keys():
                         if k in new_index:
@@ -730,7 +822,7 @@ def render_table_ui(tab, table_key):
                     st.error("Error processing edits for approval: " + str(e))
 
         # -------------------------
-        # Upload / Manual Insert / Temp CRUD (unchanged)
+        # Upload / Manual Insert / Temp CRUD
         # -------------------------
         st.markdown("---")
         st.markdown("### Upload Excel or CSV (Inserts into TEMP Table)")
@@ -793,43 +885,74 @@ def render_table_ui(tab, table_key):
 
         st.subheader("Update Record (in TEMP Table)")
         with st.form("update_form_" + table_key):
-            upd_key = st.text_input(key_col + " to Update")
-            upd_col = st.selectbox("Column to Update", [c for c in required_cols if c != key_col])
+            # For composite keys show multiple inputs; else single input
+            key_inputs = {}
+            if isinstance(key_cols, (list, tuple)):
+                cols_ui = st.columns(len(key_cols))
+                for i, kc in enumerate(key_cols):
+                    with cols_ui[i]:
+                        val = st.text_input(kc + " value")
+                        key_inputs[kc] = val
+            else:
+                key_inputs[key_cols] = st.text_input(f"{key_cols} to Update")
+
+            upd_col = st.selectbox("Column to Update", [c for c in required_cols if (not isinstance(key_cols, str) or c != key_cols)])
             new_value = st.text_input("New Value")
             submit_upd = st.form_submit_button("Update Record")
             if submit_upd:
-                if not upd_key:
-                    old_val = None
-                else:
+                # read old value from temp_table using built WHERE clause
+                where_clause = build_where_from_key_inputs(key_cols, key_inputs)
+                old_val = None
+                if where_clause:
                     try:
-                        escaped_upd_key = str(normalize_string(upd_key)).replace("'", "''")
-                        old_val_df = session.sql("SELECT " + upd_col + " FROM " + temp_table + " WHERE " + key_col + " = '" + escaped_upd_key + "'").to_pandas()
+                        old_val_df = session.sql("SELECT " + upd_col + " FROM " + temp_table + " WHERE " + where_clause).to_pandas()
                         old_val = old_val_df.iloc[0, 0] if not old_val_df.empty else None
                     except Exception:
                         old_val = None
+                # prepare escaped new value
                 escaped_new_value = "" if new_value is None else str(normalize_string(new_value)).replace("'", "''")
-                escaped_upd_key = "" if upd_key is None else str(normalize_string(upd_key)).replace("'", "''")
-                update_sql = "UPDATE " + temp_table + " SET " + upd_col + " = '" + escaped_new_value + "' WHERE " + key_col + " = '" + escaped_upd_key + "'"
-                session.sql(update_sql).collect()
-                log_change(main_table, "UPDATE", {upd_col: old_val}, {upd_col: new_value})
-                st.success("Record updated in TEMP and logged.")
+                # perform update
+                if where_clause:
+                    update_sql = "UPDATE " + temp_table + " SET " + upd_col + " = '" + escaped_new_value + "' WHERE " + where_clause
+                else:
+                    st.error("Could not build WHERE clause for update - please provide key values.")
+                    update_sql = None
+                if update_sql:
+                    session.sql(update_sql).collect()
+                    log_change(main_table, "UPDATE", {upd_col: old_val}, {upd_col: new_value})
+                    st.success("Record updated in TEMP and logged.")
 
         st.subheader("Delete Record (from TEMP Table)")
         with st.form("delete_form_" + table_key):
-            del_key = st.text_input(key_col + " to Delete")
+            # For composite keys show multiple inputs; else single input
+            del_key_inputs = {}
+            if isinstance(key_cols, (list, tuple)):
+                cols_ui = st.columns(len(key_cols))
+                for i, kc in enumerate(key_cols):
+                    with cols_ui[i]:
+                        val = st.text_input(kc + " value (for delete)")
+                        del_key_inputs[kc] = val
+            else:
+                del_key_inputs[key_cols] = st.text_input(f"{key_cols} to Delete")
+
             confirm = st.checkbox("Confirm Delete")
             submit_del = st.form_submit_button("Delete Record")
             if submit_del and confirm:
-                try:
-                    escaped_del_key = str(normalize_string(del_key)).replace("'", "''")
-                    old_val_df = session.sql("SELECT * FROM " + temp_table + " WHERE " + key_col + " = '" + escaped_del_key + "'").to_pandas()
-                    old_val = old_val_df.to_dict(orient="records")[0] if not old_val_df.empty else None
-                except Exception:
-                    old_val = None
-                delete_sql = "DELETE FROM " + temp_table + " WHERE " + key_col + " = '" + escaped_del_key + "'"
-                session.sql(delete_sql).collect()
-                log_change(main_table, "DELETE", old_val, None)
-                st.success("Record deleted from TEMP and logged.")
+                where_clause = build_where_from_key_inputs(key_cols, del_key_inputs)
+                old_val = None
+                if where_clause:
+                    try:
+                        old_val_df = session.sql("SELECT * FROM " + temp_table + " WHERE " + where_clause).to_pandas()
+                        old_val = old_val_df.to_dict(orient="records")[0] if not old_val_df.empty else None
+                    except Exception:
+                        old_val = None
+                if not where_clause:
+                    st.error("Could not build WHERE clause for delete - please provide key values.")
+                else:
+                    delete_sql = "DELETE FROM " + temp_table + " WHERE " + where_clause
+                    session.sql(delete_sql).collect()
+                    log_change(main_table, "DELETE", old_val, None)
+                    st.success("Record deleted from TEMP and logged.")
             elif submit_del:
                 st.warning("Please confirm delete before proceeding.")
 
