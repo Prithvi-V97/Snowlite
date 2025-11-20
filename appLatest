@@ -30,19 +30,22 @@ except Exception:
 
 # -------------------------
 # Table mappings (edit as needed)
+# Note: added explicit key_col to avoid wrong key selection
 # -------------------------
 main_tables = {
     "DDM_DOMAIN_VALUE": {
         "name": "OMNIDDM_TK270.COMMON.DDM_DOMAIN_VALUE",
         "temp": "OMNIDDM_TK270.COMMON.DDM_DOMAIN_VALUE_TEMP",
         "log":  "OMNIDDM_TK270.COMMON.DDM_DOMAIN_VALUE_LOG",
-        "required_cols": ["TARGETENTITY", "TARGETDOMAIN", "DOMAINVALUE", "DESCRIPTION"]
+        "required_cols": ["TARGETENTITY", "TARGETDOMAIN", "DOMAINVALUE", "DESCRIPTION"],
+        "key_col": "DOMAINVALUE"   # explicit key column (fixes edit detection)
     },
     "DDM_XREF_DOMAIN_VALUE": {
         "name": "OMNIDDM_TK270.COMMON.DDM_XREF_DOMAIN_VALUE",
         "temp": "OMNIDDM_TK270.COMMON.DDM_XREF_DOMAIN_VALUE_TEMP",
         "log":  "OMNIDDM_TK270.COMMON.DDM_XREF_DOMAIN_VALUE_LOG",
         "required_cols": ["TARGETENTITY", "TARGETDOMAIN", "TARGETDOMAINVALUE", "FROMENTITY", "FROMDOMAIN", "FROMDOMAINVALUE"]
+        # no explicit key_col here — will default to last required_cols element (works for this table)
     }
 }
 
@@ -206,7 +209,8 @@ def render_table_ui(tab, table_key):
     temp_table = info["temp"]
     log_table = info["log"]
     required_cols = info["required_cols"]
-    key_col = required_cols[-1]  # assume last required column is the row key
+    # use explicit key_col if provided, otherwise fall back to last element
+    key_col = info.get("key_col", required_cols[-1])
 
     with tab:
         # -------------------------
@@ -451,15 +455,13 @@ def render_table_ui(tab, table_key):
                                             session.sql(
                                                 "UPDATE " + log_table +
                                                 " SET approved = TRUE, approved_by = 'business_user', approved_at = CURRENT_TIMESTAMP "
-                                                "WHERE table_name = '" + str(table_name_db).replace("'", "''") +
-                                                "' AND changed_at = '" + str(db_row.get('changed_at')).replace("'", "''") + "'"
+                                                "WHERE table_name = '" + str(table_name_db).replace("'", "''") + "' AND changed_at = '" + str(db_row.get('changed_at')).replace("'", "''") + "'"
                                             ).collect()
                                     else:
                                         session.sql(
                                             "UPDATE " + log_table +
                                             " SET approved = TRUE, approved_by = 'business_user', approved_at = CURRENT_TIMESTAMP "
-                                            "WHERE table_name = '" + str(table_name_db).replace("'", "''") +
-                                            "' AND changed_at = '" + str(db_row.get('changed_at')).replace("'", "''") + "'"
+                                            "WHERE table_name = '" + str(table_name_db).replace("'", "''") + "' AND changed_at = '" + str(db_row.get('changed_at')).replace("'", "''") + "'"
                                         ).collect()
                                 except Exception as e:
                                     errors.append("Could not mark log approved for log_id=" + str(log_id) + ": " + str(e))
