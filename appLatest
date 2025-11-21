@@ -159,7 +159,7 @@ def log_change(main_table_name, action, old_value=None, new_value=None):
     cleaned_old = clean_for_json(old_value) if old_value is not None else None
     cleaned_new = clean_for_json(new_value) if new_value is not None else None
     old_json = json.dumps(cleaned_old) if cleaned_old is not None else None
-    new_json = json.dumps(cleaned_new) if new_json is not None else None
+    new_json = json.dumps(cleaned_new) if cleaned_new is not None else None
     old_sql_val = "$$ " + old_json + " $$" if old_json is not None else "NULL"
     new_sql_val = "$$ " + new_json + " $$" if new_json is not None else "NULL"
     insert_sql = (
@@ -484,7 +484,7 @@ def render_table_ui(tab, table_key):
             if "approve" in edited_logs.columns:
                 st.session_state[approve_key] = list(edited_logs["approve"])
 
-            # Approval handler
+            # Approval handler (keeps previous coercion logic for main table writes)
             if st.button(f"Approve Selected Records for {table_key}"):
                 ensure_session()
                 try:
@@ -778,15 +778,21 @@ def render_table_ui(tab, table_key):
                         key=f"data_editor_main_{table_key}"
                     )
 
-            # Send Edits to Approval (paired-update logic)
+            # -------------------------
+            # SIMPLE DETERMINISTIC "Send Edits to Approval" handler
+            # (replaces the previous complex pairing logic)
+            # -------------------------
             if st.button("Send Edits to Approval", key=f"send_edits_{table_key}"):
                 try:
+                    ensure_session()
+
+                    # original and edited DataFrames
                     orig = main_df.copy()
                     new = edited_data.copy()
 
+                    # build index maps keyed by stable key (supports composite key)
                     orig_index = {}
                     new_index = {}
-
                     if not orig.empty:
                         for _, r in orig.iterrows():
                             k = get_row_key(r, key_cols)
@@ -796,284 +802,321 @@ def render_table_ui(tab, table_key):
                             k = get_row_key(r, key_cols)
                             new_index[k] = r
 
-                    def is_empty_key(k):
-                        if isinstance(k, tuple):
-                            return all((str(p) == "" or str(p).lower() == "nan") for p in k)
-                        if isinstance(k, str):
-                            return (k == "" or k.lower() == "nan")
-                        return False
+                    # classify keys
+                    orig_keys = set(orig_index.keys())
+                    new_keys = set(new_index.keys())
 
-                    deleted_keys = [k for k in orig_index.keys() if k not in new_index.keys()]
-                    inserted_keys = [k for k in new_index.keys() if (k not in orig_index.keys() or is_empty_key(k))]
-                    updated_keys = []
-                    for k in orig_index.keys():
-                        if k in new_index:
-                            o = orig_index[k]
-                            n = new_index[k]
-                            changed = False
-                            for c in orig.columns:
-                                o_val = get_series_value(o, c)
-                                n_val = get_series_value(n, c)
-                                if (o_val is None and n_val is None) or (o_val == n_val):
-                                    continue
-                                changed = True
-                                break
-                            if changed:
-                                updated_keys.append(k)
-
-                    paired_updates = []
-                    if deleted_keys and inserted_keys:
-                        non_key_cols = [c for c in orig.columns if (not (isinstance(key_cols, (list, tuple)) and c in key_cols) and not (isinstance(key_cols, str) and c == key_cols))]
-                        if not non_key_cols:
-                            if isinstance(key_cols, (list, tuple)):
-                                non_key_cols = [c for c in required_cols if c not in key_cols]
-                            else:
-                                non_key_cols = [c for c in required_cols if c != key_cols]
-
-                        def non_key_signature(row):
-                            sig = []
-                            for col in non_key_cols:
-                                v = get_series_value(row, col)
-                                sig.append('' if v is None else str(v))
-                            return tuple(sig)
-
-                        deleted_sigs = {dk: non_key_signature(orig_index[dk]) for dk in deleted_keys}
-                        inserted_sigs = {ik: non_key_signature(new_index[ik]) for ik in inserted_keys}
-
-                        used_inserts = set()
-                        used_deletes = set()
-                        for dk, dsig in deleted_sigs.items():
-                            for ik, isig in inserted_sigs.items():
-                                if ik in used_inserts:
-                                    continue
-                                if dsig == isig:
-                                    paired_updates.append((dk, ik))
-                                    used_deletes.add(dk)
-                                    used_inserts.add(ik)
-                                    break
-
-                        deleted_keys = [k for k in deleted_keys if k not in used_deletes]
-                        inserted_keys = [k for k in inserted_keys if k not in used_inserts]
+                    inserted_keys = new_keys - orig_keys           # new rows (INSERT)
+                    deleted_keys  = orig_keys - new_keys           # removed rows (DELETE)
+                    possible_updates = orig_keys & new_keys        # same key -> maybe UPDATE
 
                     processed = 0
                     errors = []
 
-                    # Process paired updates
-                    for old_k, new_k in paired_updates:
+                    # Helper to build SQL insert into TEMP using required_cols (keeps DESCRIPTION)
+                    def insert_row_into_temp_from_series(series_row):
+                        cols_sql = ", ".join(required_cols)
+                        vals = []
+                        for c in required_cols:
+                            v = get_series_value(series_row, c)
+                            if v is None or v == "":
+                                vals.append("NULL")
+                            else:
+                                # escape single quotes safely
+                                sval = str(v).replace("'", "''")
+                                vals.append("'" + normalize_string(sval) + "'")
+                        vals_sql = ", ".join(vals)
+                        insert_sql = "INSERT INTO " + temp_table + " (" + cols_sql + ") VALUES (" + vals_sql + ")"
+                        session.sql(insert_sql).collect()
+
+                    # Process INSERTs (new rows)
+                    for k in inserted_keys:
                         try:
-                            orig_row = orig_index.get(old_k)
-                            new_row = new_index.get(new_k)
-                            vals_list = []
-                            for col in required_cols:
-                                v = get_series_value(new_row, col) if new_row is not None else None
-                                if v is None or v == "":
-                                    vals_list.append("NULL")
-                                else:
-                                    vals_list.append("'" + str(v).replace("'", "''") + "'")
-                            cols_sql = ", ".join(required_cols)
-                            vals_sql = ", ".join(vals_list)
-                            insert_temp_sql = "INSERT INTO " + temp_table + " (" + cols_sql + ") VALUES (" + vals_sql + ")"
-                            session.sql(insert_temp_sql).collect()
-                            old_d = {}
-                            new_d = {}
-                            for col in required_cols:
-                                o = get_series_value(orig_row, col) if orig_row is not None else None
-                                n = get_series_value(new_row, col) if new_row is not None else None
-                                old_d[col] = o
-                                new_d[col] = n
-                            log_change(main_table, "UPDATE", old_d, new_d)
+                            new_row = new_index[k]
+                            # insert into temp
+                            insert_row_into_temp_from_series(new_row)
+                            # build new dict for log
+                            new_dict = {c: get_series_value(new_row, c) for c in required_cols}
+                            log_change(main_table, "INSERT", None, new_dict)
                             processed += 1
                         except Exception as e:
-                            errors.append("Error processing paired update old_key=" + str(old_k) + " new_key=" + str(new_k) + ": " + str(e))
+                            errors.append(f"Insert key={k} failed: {e}")
 
-                    # Unchanged-key updates
-                    for k in updated_keys:
+                    # Process DELETEs (rows removed from main by user)
+                    for k in deleted_keys:
                         try:
-                            orig_row = orig_index.get(k)
-                            new_row = new_index.get(k)
-                            vals_list = []
-                            for col in required_cols:
-                                v = get_series_value(new_row, col) if new_row is not None else None
-                                if v is None or v == "":
-                                    vals_list.append("NULL")
-                                else:
-                                    vals_list.append("'" + str(v).replace("'", "''") + "'")
-                            cols_sql = ", ".join(required_cols)
-                            vals_sql = ", ".join(vals_list)
-                            insert_temp_sql = "INSERT INTO " + temp_table + " (" + cols_sql + ") VALUES (" + vals_sql + ")"
-                            session.sql(insert_temp_sql).collect()
-                            old_d = {}
-                            new_d = {}
-                            for col in required_cols:
-                                o = get_series_value(orig_row, col) if orig_row is not None else None
-                                n = get_series_value(new_row, col) if new_row is not None else None
-                                old_d[col] = o
-                                new_d[col] = n
-                            log_change(main_table, "UPDATE", old_d, new_d)
+                            old_row = orig_index[k]
+                            # insert old row into temp so approval can delete from main after approval
+                            insert_row_into_temp_from_series(old_row)
+                            old_dict = {c: get_series_value(old_row, c) for c in required_cols}
+                            log_change(main_table, "DELETE", old_dict, None)
                             processed += 1
                         except Exception as e:
-                            errors.append("Error processing update key=" + str(k) + ": " + str(e))
+                            errors.append(f"Delete key={k} failed: {e}")
 
-                    # Inserts
-                    for ik in inserted_keys:
+                    # Process UPDATES (same key but values changed)
+                    for k in possible_updates:
                         try:
-                            new_row = new_index.get(ik)
-                            vals_list = []
-                            for col in required_cols:
-                                v = get_series_value(new_row, col) if new_row is not None else None
-                                if v is None or v == "":
-                                    vals_list.append("NULL")
+                            old_row = orig_index[k]
+                            new_row = new_index[k]
+                            # detect if any value changed (normalize strings)
+                            changed = False
+                            for c in required_cols:
+                                o_val = get_series_value(old_row, c)
+                                n_val = get_series_value(new_row, c)
+                                # normalize string comparison
+                                if isinstance(o_val, str):
+                                    o_val_cmp = normalize_string(o_val)
                                 else:
-                                    vals_list.append("'" + str(v).replace("'", "''") + "'")
-                            cols_sql = ", ".join(required_cols)
-                            vals_sql = ", ".join(vals_list)
-                            insert_temp_sql = "INSERT INTO " + temp_table + " (" + cols_sql + ") VALUES (" + vals_sql + ")"
-                            session.sql(insert_temp_sql).collect()
-                            nv = new_row.to_dict() if hasattr(new_row, "to_dict") else new_row
-                            log_change(main_table, "INSERT", None, nv)
+                                    o_val_cmp = o_val
+                                if isinstance(n_val, str):
+                                    n_val_cmp = normalize_string(n_val)
+                                else:
+                                    n_val_cmp = n_val
+                                if o_val_cmp != n_val_cmp:
+                                    changed = True
+                                    break
+                            if not changed:
+                                continue  # no-op
+
+                            # insert new_row into temp (so approver can see new data)
+                            insert_row_into_temp_from_series(new_row)
+
+                            # prepare dicts for log (old/new)
+                            old_dict = {c: get_series_value(old_row, c) for c in required_cols}
+                            new_dict = {c: get_series_value(new_row, c) for c in required_cols}
+                            log_change(main_table, "UPDATE", old_dict, new_dict)
                             processed += 1
                         except Exception as e:
-                            errors.append("Error processing insert key=" + str(ik) + ": " + str(e))
+                            errors.append(f"Update key={k} failed: {e}")
 
-                    # Deletes
-                    for dk in deleted_keys:
-                        try:
-                            old_row = orig_index.get(dk)
-                            vals_list = []
-                            for col in required_cols:
-                                v = get_series_value(old_row, col) if old_row is not None else None
-                                if v is None or v == "":
-                                    vals_list.append("NULL")
-                                else:
-                                    vals_list.append("'" + str(v).replace("'", "''") + "'")
-                            cols_sql = ", ".join(required_cols)
-                            vals_sql = ", ".join(vals_list)
-                            insert_temp_sql = "INSERT INTO " + temp_table + " (" + cols_sql + ") VALUES (" + vals_sql + ")"
-                            session.sql(insert_temp_sql).collect()
-                            log_change(main_table, "DELETE", old_row.to_dict() if hasattr(old_row, "to_dict") else old_row, None)
-                            processed += 1
-                        except Exception as e:
-                            errors.append("Error processing delete key=" + str(dk) + ": " + str(e))
-
-                    st.success("Sent edits to TEMP and logged for approval. Processed: " + str(processed))
+                    st.success(f"Sent edits to TEMP and logged for approval. Processed: {processed}")
                     if errors:
                         for er in errors:
                             st.warning(er)
 
+                    # refresh the page so pending count and main display reflect latest DB state
+                    try:
+                        if hasattr(st, "experimental_rerun"):
+                            st.experimental_rerun()
+                        elif hasattr(st, "rerun"):
+                            st.rerun()
+                        else:
+                            import streamlit.components.v1 as components
+                            components.html("<script>window.location.reload()</script>", height=0)
+                    except Exception:
+                        pass
+
                 except Exception as e:
                     st.error("Error processing edits for approval: " + str(e))
 
-        # Upload / Manual Insert / Temp CRUD (upload block kept similar to earlier)
-        st.markdown("---")
-        st.markdown("### Upload Excel or CSV (Inserts into TEMP Table)")
+            # -------------------------
+            # Upload / Manual Insert / Temp CRUD
+            # -------------------------
+            st.markdown("---")
+            st.markdown("### Upload Excel or CSV (Inserts into TEMP Table)")
 
-        # (Robust upload block omitted here for brevity — keep previously-added schema-aware upload code)
-        # In your deployed file, ensure the schema-aware upload block from the previous step is present here.
+            # -------------------------
+            # Robust type-aware upload block (schema introspection + coercion)
+            # -------------------------
+            uploaded_file = st.file_uploader("Upload for " + table_key, type=["xlsx", "csv"])
+            if uploaded_file:
+                ensure_session()
+                excel_df = read_uploaded_file(uploaded_file)
+                if excel_df is not None:
+                    # normalize incoming column names to upper-case (matching Snowflake)
+                    excel_df.columns = [col.strip().upper() for col in excel_df.columns]
+                    cols_in_file = list(excel_df.columns)
+                    st.dataframe(excel_df.head())
 
-        # For brevity in this view, reusing existing upload / insert / update / delete implementations
-        # (but your actual file should contain the robust upload block provided earlier).
+                    # fetch temp table metadata if possible (DB.SCHEMA.TABLE)
+                    table_col_types = {}
+                    try:
+                        parts = temp_table.split(".")
+                        if len(parts) == 3:
+                            db_name, schema_name, tbl_name = parts
+                            q = (
+                                "SELECT column_name, data_type FROM "
+                                f"{db_name}.information_schema.columns "
+                                f"WHERE table_name = '{tbl_name}' AND table_schema = '{schema_name}'"
+                            )
+                            cols_meta = session.sql(q).to_pandas()
+                            table_col_types = {r['COLUMN_NAME'].upper(): str(r['DATA_TYPE']).upper() for _, r in cols_meta.iterrows()}
+                        else:
+                            st.warning("Temp table name not in DB.SCHEMA.TABLE format; skipping schema introspection.")
+                    except Exception as e:
+                        st.warning("Could not fetch temp table metadata; proceeding with file columns only. Error: " + str(e))
+                        table_col_types = {}
 
-        # Manual insert
-        st.subheader("Manual Insert into TEMP Table")
-        with st.form("insert_form_" + table_key):
-            inputs = {col: st.text_input(col) for col in required_cols}
-            submit = st.form_submit_button("Insert Record")
-            if submit:
-                cols_sql = ", ".join(inputs.keys())
-                cleaned_vals = []
-                for v in inputs.values():
-                    if isinstance(v, str):
-                        v = normalize_string(v)
-                    if v == "" or v is None:
-                        cleaned_vals.append("NULL")
+                    # decide which columns to insert
+                    if table_col_types:
+                        cols_to_insert = [c for c in cols_in_file if c in table_col_types]
+                        if not cols_to_insert:
+                            st.error("None of the uploaded columns match columns in the TEMP table. Aborting upload.")
+                            cols_to_insert = []
                     else:
-                        cleaned_vals.append("'" + str(v).replace("'", "''") + "'")
-                vals_sql = ", ".join(cleaned_vals)
-                insert_sql = "INSERT INTO " + temp_table + " (" + cols_sql + ") VALUES (" + vals_sql + ")"
-                try:
-                    session.sql(insert_sql).collect()
-                    log_change(main_table, "INSERT", None, {k: normalize_string(v) if isinstance(v, str) else v for k, v in inputs.items()})
-                    st.success("Record inserted into TEMP and logged.")
-                except Exception as e:
-                    st.error("Insert to TEMP failed: " + str(e))
+                        cols_to_insert = cols_in_file
 
-        # Update in TEMP
-        st.subheader("Update Record (in TEMP Table)")
-        with st.form("update_form_" + table_key):
-            key_inputs = {}
-            if isinstance(key_cols, (list, tuple)):
-                cols_ui = st.columns(len(key_cols))
-                for i, kc in enumerate(key_cols):
-                    with cols_ui[i]:
-                        val = st.text_input(kc + " value")
-                        key_inputs[kc] = val
-            else:
-                key_inputs[key_cols] = st.text_input(f"{key_cols} to Update")
+                    if cols_to_insert:
+                        if st.button("Upload to TEMP for " + table_key):
+                            inserted = 0
+                            for _, row in excel_df.iterrows():
+                                vals_list = []
+                                for col in cols_to_insert:
+                                    raw_v = row.get(col, "")
+                                    if isinstance(raw_v, str):
+                                        raw_v = normalize_string(raw_v)
+                                    try:
+                                        if pd.isna(raw_v):
+                                            raw_v = None
+                                    except Exception:
+                                        pass
+                                    col_type = table_col_types.get(col, "")
+                                    try:
+                                        if col_type and ("TIMESTAMP" in col_type or "DATE" in col_type or "TIME" in col_type):
+                                            dt = pd.to_datetime(raw_v, errors="coerce", dayfirst=False)
+                                            if pd.isna(dt):
+                                                vals_list.append("NULL")
+                                            else:
+                                                val_str = dt.strftime("%Y-%m-%d %H:%M:%S")
+                                                vals_list.append(sql_literal(val_str))
+                                        elif col_type and any(x in col_type for x in ("NUMBER", "INT", "DECIMAL", "NUMERIC", "FLOAT", "DOUBLE")):
+                                            try:
+                                                if raw_v is None or raw_v == "":
+                                                    vals_list.append("NULL")
+                                                else:
+                                                    num = float(raw_v)
+                                                    vals_list.append(str(int(num)) if num.is_integer() else str(num))
+                                            except Exception:
+                                                vals_list.append("NULL")
+                                        else:
+                                            if raw_v is None or raw_v == "":
+                                                vals_list.append("NULL")
+                                            else:
+                                                sval = str(raw_v).replace("'", "''")
+                                                vals_list.append("'" + sval + "'")
+                                    except Exception:
+                                        vals_list.append("NULL")
 
-            upd_col = st.selectbox("Column to Update", [c for c in required_cols if (not isinstance(key_cols, str) or c != key_cols)])
-            new_value = st.text_input("New Value")
-            submit_upd = st.form_submit_button("Update Record")
-            if submit_upd:
-                where_clause = build_where_from_key_inputs(key_cols, key_inputs)
-                old_val = None
-                if where_clause:
+                                cols_sql = ", ".join(cols_to_insert)
+                                vals_sql = ", ".join(vals_list)
+                                insert_sql = "INSERT INTO " + temp_table + " (" + cols_sql + ") VALUES (" + vals_sql + ")"
+                                try:
+                                    session.sql(insert_sql).collect()
+                                except Exception as e:
+                                    st.error("Insert to TEMP failed: " + str(e))
+                                    continue
+
+                                row_dict = {c: clean_for_json(normalize_string(row.get(c)) if isinstance(row.get(c), str) else row.get(c)) for c in cols_to_insert}
+                                try:
+                                    log_change(main_table, "INSERT", None, row_dict)
+                                except Exception as e:
+                                    st.warning("Failed to write log for inserted row: " + str(e))
+                                inserted += 1
+
+                            st.success(str(inserted) + " rows uploaded to TEMP table and logged.")
+
+            # Manual insert
+            st.subheader("Manual Insert into TEMP Table")
+            with st.form("insert_form_" + table_key):
+                inputs = {col: st.text_input(col) for col in required_cols}
+                submit = st.form_submit_button("Insert Record")
+                if submit:
+                    cols_sql = ", ".join(inputs.keys())
+                    cleaned_vals = []
+                    for v in inputs.values():
+                        if isinstance(v, str):
+                            v = normalize_string(v)
+                        if v == "" or v is None:
+                            cleaned_vals.append("NULL")
+                        else:
+                            cleaned_vals.append("'" + str(v).replace("'", "''") + "'")
+                    vals_sql = ", ".join(cleaned_vals)
+                    insert_sql = "INSERT INTO " + temp_table + " (" + cols_sql + ") VALUES (" + vals_sql + ")"
                     try:
-                        ensure_session()
-                        old_val_df = session.sql("SELECT " + upd_col + " FROM " + temp_table + " WHERE " + where_clause).to_pandas()
-                        old_val = old_val_df.iloc[0, 0] if not old_val_df.empty else None
-                    except Exception:
-                        old_val = None
-                escaped_new_value = "" if new_value is None else str(normalize_string(new_value)).replace("'", "''")
-                if where_clause:
-                    update_sql = "UPDATE " + temp_table + " SET " + upd_col + " = '" + escaped_new_value + "' WHERE " + where_clause
-                else:
-                    st.error("Could not build WHERE clause for update - please provide key values.")
-                    update_sql = None
-                if update_sql:
-                    try:
-                        session.sql(update_sql).collect()
-                        log_change(main_table, "UPDATE", {upd_col: old_val}, {upd_col: new_value})
-                        st.success("Record updated in TEMP and logged.")
+                        session.sql(insert_sql).collect()
+                        log_change(main_table, "INSERT", None, {k: normalize_string(v) if isinstance(v, str) else v for k, v in inputs.items()})
+                        st.success("Record inserted into TEMP and logged.")
                     except Exception as e:
-                        st.error("Update in TEMP failed: " + str(e))
+                        st.error("Insert to TEMP failed: " + str(e))
 
-        # Delete in TEMP
-        st.subheader("Delete Record (from TEMP Table)")
-        with st.form("delete_form_" + table_key):
-            del_key_inputs = {}
-            if isinstance(key_cols, (list, tuple)):
-                cols_ui = st.columns(len(key_cols))
-                for i, kc in enumerate(key_cols):
-                    with cols_ui[i]:
-                        val = st.text_input(kc + " value (for delete)")
-                        del_key_inputs[kc] = val
-            else:
-                del_key_inputs[key_cols] = st.text_input(f"{key_cols} to Delete")
-
-            confirm = st.checkbox("Confirm Delete")
-            submit_del = st.form_submit_button("Delete Record")
-            if submit_del and confirm:
-                where_clause = build_where_from_key_inputs(key_cols, del_key_inputs)
-                old_val = None
-                if where_clause:
-                    try:
-                        ensure_session()
-                        old_val_df = session.sql("SELECT * FROM " + temp_table + " WHERE " + where_clause).to_pandas()
-                        old_val = old_val_df.to_dict(orient="records")[0] if not old_val_df.empty else None
-                    except Exception:
-                        old_val = None
-                if not where_clause:
-                    st.error("Could not build WHERE clause for delete - please provide key values.")
+            # Update in TEMP
+            st.subheader("Update Record (in TEMP Table)")
+            with st.form("update_form_" + table_key):
+                key_inputs = {}
+                if isinstance(key_cols, (list, tuple)):
+                    cols_ui = st.columns(len(key_cols))
+                    for i, kc in enumerate(key_cols):
+                        with cols_ui[i]:
+                            val = st.text_input(kc + " value")
+                            key_inputs[kc] = val
                 else:
-                    delete_sql = "DELETE FROM " + temp_table + " WHERE " + where_clause
-                    try:
-                        session.sql(delete_sql).collect()
-                        log_change(main_table, "DELETE", old_val, None)
-                        st.success("Record deleted from TEMP and logged.")
-                    except Exception as e:
-                        st.error("Delete in TEMP failed: " + str(e))
-            elif submit_del:
-                st.warning("Please confirm delete before proceeding.")
+                    key_inputs[key_cols] = st.text_input(f"{key_cols} to Update")
+
+                upd_col = st.selectbox("Column to Update", [c for c in required_cols if (not isinstance(key_cols, str) or c != key_cols)])
+                new_value = st.text_input("New Value")
+                submit_upd = st.form_submit_button("Update Record")
+                if submit_upd:
+                    where_clause = build_where_from_key_inputs(key_cols, key_inputs)
+                    old_val = None
+                    if where_clause:
+                        try:
+                            ensure_session()
+                            old_val_df = session.sql("SELECT " + upd_col + " FROM " + temp_table + " WHERE " + where_clause).to_pandas()
+                            old_val = old_val_df.iloc[0, 0] if not old_val_df.empty else None
+                        except Exception:
+                            old_val = None
+                    escaped_new_value = "" if new_value is None else str(normalize_string(new_value)).replace("'", "''")
+                    if where_clause:
+                        update_sql = "UPDATE " + temp_table + " SET " + upd_col + " = '" + escaped_new_value + "' WHERE " + where_clause
+                    else:
+                        st.error("Could not build WHERE clause for update - please provide key values.")
+                        update_sql = None
+                    if update_sql:
+                        try:
+                            session.sql(update_sql).collect()
+                            log_change(main_table, "UPDATE", {upd_col: old_val}, {upd_col: new_value})
+                            st.success("Record updated in TEMP and logged.")
+                        except Exception as e:
+                            st.error("Update in TEMP failed: " + str(e))
+
+            # Delete in TEMP
+            st.subheader("Delete Record (from TEMP Table)")
+            with st.form("delete_form_" + table_key):
+                del_key_inputs = {}
+                if isinstance(key_cols, (list, tuple)):
+                    cols_ui = st.columns(len(key_cols))
+                    for i, kc in enumerate(key_cols):
+                        with cols_ui[i]:
+                            val = st.text_input(kc + " value (for delete)")
+                            del_key_inputs[kc] = val
+                else:
+                    del_key_inputs[key_cols] = st.text_input(f"{key_cols} to Delete")
+
+                confirm = st.checkbox("Confirm Delete")
+                submit_del = st.form_submit_button("Delete Record")
+                if submit_del and confirm:
+                    where_clause = build_where_from_key_inputs(key_cols, del_key_inputs)
+                    old_val = None
+                    if where_clause:
+                        try:
+                            ensure_session()
+                            old_val_df = session.sql("SELECT * FROM " + temp_table + " WHERE " + where_clause).to_pandas()
+                            old_val = old_val_df.to_dict(orient="records")[0] if not old_val_df.empty else None
+                        except Exception:
+                            old_val = None
+                    if not where_clause:
+                        st.error("Could not build WHERE clause for delete - please provide key values.")
+                    else:
+                        delete_sql = "DELETE FROM " + temp_table + " WHERE " + where_clause
+                        try:
+                            session.sql(delete_sql).collect()
+                            log_change(main_table, "DELETE", old_val, None)
+                            st.success("Record deleted from TEMP and logged.")
+                        except Exception as e:
+                            st.error("Delete in TEMP failed: " + str(e))
+                elif submit_del:
+                    st.warning("Please confirm delete before proceeding.")
 
 # Tabs
 tab1, tab2 = st.tabs(["DDM_DOMAIN_VALUE", "DDM_XREF_DOMAIN_VALUE"])
