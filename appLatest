@@ -187,7 +187,7 @@ def log_change(main_table_name, action, old_value=None, new_value=None):
     cleaned_old = clean_for_json(old_value) if old_value is not None else None
     cleaned_new = clean_for_json(new_value) if new_value is not None else None
     old_json = json.dumps(cleaned_old) if cleaned_old is not None else None
-    new_json = json.dumps(cleaned_new) if cleaned_new is not None else None
+    new_json = json.dumps(cleaned_new) if new_json is not None else None
     old_sql_val = "$$ " + old_json + " $$" if old_json is not None else "NULL"
     new_sql_val = "$$ " + new_json + " $$" if new_json is not None else "NULL"
     insert_sql = (
@@ -301,7 +301,6 @@ def get_row_key(row, key_cols):
     Return stable key for a row (tuple for composite keys, string for single).
     NORMALIZATION: remove NBSP, collapse spaces, UPPERCASE so keys match robustly.
     """
-
     def norm_value(v):
         if v is None:
             return ""
@@ -891,9 +890,62 @@ def render_table_ui(tab, table_key):
                             if not changed:
                                 continue
 
-                            # Build old/new dicts
-                            old_dict = {c: get_series_value(old_row, c) for c in required_cols} if old_row is not None else {c: None for c in required_cols}
+                            # ---------------------------
+                            # NEW: Build authoritative old_dict by querying MAIN table first
+                            # then fallback to in-memory old_row if DB fetch fails.
+                            # ---------------------------
+
+                            # Build new_dict from the edited row (always available)
                             new_dict = {c: get_series_value(new_row, c) for c in required_cols}
+
+                            # -------------------------------------------------------
+                            # Fetch authoritative old_dict from MAIN TABLE (DB) using key columns
+                            # Fallback to in-memory old_row if DB fetch fails or returns no row
+                            # -------------------------------------------------------
+                            old_dict = {c: None for c in required_cols}
+                            try:
+                                # Build key_inputs map using old_row if available else new_row values
+                                key_inputs = {}
+                                if isinstance(key_cols, (list, tuple)):
+                                    for kc in key_cols:
+                                        key_inputs[kc] = get_series_value(old_row, kc) if old_row is not None else get_series_value(new_row, kc)
+                                else:
+                                    key_inputs[key_cols] = get_series_value(old_row, key_cols) if old_row is not None else get_series_value(new_row, key_cols)
+
+                                where_clause = build_where_from_key_inputs(key_cols, key_inputs)
+                                if where_clause:
+                                    sel_cols = ", ".join(required_cols)
+                                    sel_sql = "SELECT " + sel_cols + " FROM " + main_table + " WHERE " + where_clause + " LIMIT 1"
+                                    try:
+                                        fetched_df = session.sql(sel_sql).to_pandas()
+                                        if not fetched_df.empty:
+                                            fetched_row = fetched_df.iloc[0].to_dict()
+                                            # Map fetched_row values to required_cols (case-insensitive)
+                                            for c in required_cols:
+                                                val = None
+                                                for fk, fv in fetched_row.items():
+                                                    if str(fk).upper() == str(c).upper():
+                                                        val = fv
+                                                        break
+                                                # normalize strings (remove NBSP) and keep other types as-is
+                                                old_dict[c] = normalize_string(val) if isinstance(val, str) else clean_for_json(val)
+                                    except Exception:
+                                        # DB fetch failed — fallback to in-memory old_row below
+                                        pass
+
+                                # If DB fetch didn't populate old_dict, fall back to in-memory `old_row`
+                                if all(old_dict[c] is None for c in required_cols):
+                                    if old_row is not None:
+                                        old_dict = {c: get_series_value(old_row, c) for c in required_cols}
+                            except Exception:
+                                # any unexpected error: fallback to in-memory old_row or None
+                                try:
+                                    if old_row is not None:
+                                        old_dict = {c: get_series_value(old_row, c) for c in required_cols}
+                                except Exception:
+                                    old_dict = {c: None for c in required_cols}
+
+                            # Build cleaned_new_json for duplicate guard check
                             cleaned_new_json = json.dumps(clean_for_json(new_dict))
 
                             # Check duplicate pending log guard
