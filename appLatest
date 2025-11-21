@@ -19,7 +19,7 @@ except Exception:
 # App config & Snowflake session
 # -------------------------
 st.set_page_config(layout="wide")
-st.title("DDM Dual Table DML Dashboard (Final)")
+st.title("DDM Dual Table DML Dashboard")
 # attempt to get session initially (may be None if expired)
 try:
     session = get_active_session()
@@ -77,7 +77,6 @@ main_tables = {
         "temp": "OMNIDDM_TK270.COMMON.DDM_XREF_DOMAIN_VALUE_TEMP",
         "log":  "OMNIDDM_TK270.COMMON.DDM_XREF_DOMAIN_VALUE_LOG",
         "required_cols": ["TARGETENTITY", "TARGETDOMAIN", "TARGETDOMAINVALUE", "FROMENTITY", "FROMDOMAIN", "FROMDOMAINVALUE", "DESCRIPTION"]
-        # note: added DESCRIPTION to required_cols to keep behavior consistent
     }
 }
 
@@ -246,11 +245,9 @@ def get_row_key(row, key_cols):
     if isinstance(key_cols, (list, tuple)):
         parts = []
         for k in key_cols:
-            # row may be pandas Series; use .get if available
             try:
                 v = row.get(k)
             except Exception:
-                # fallback: try case-insensitive match
                 v = None
                 if hasattr(row, "__getitem__"):
                     if k in row:
@@ -271,7 +268,6 @@ def get_row_key(row, key_cols):
             parts.append('' if v is None else str(v))
         return tuple(parts)
     else:
-        # single column
         k = key_cols
         try:
             v = row.get(k)
@@ -304,13 +300,11 @@ def get_series_value(row, col):
     - converts pd.NA / np.nan to None
     """
     v = None
-    # try standard .get
     try:
         v = row.get(col)
     except Exception:
         v = None
 
-    # fallback case-insensitive lookup
     if v is None and hasattr(row, "index"):
         for colname in row.index:
             try:
@@ -320,7 +314,6 @@ def get_series_value(row, col):
             except Exception:
                 continue
 
-    # normalize strings and NaN -> None
     if isinstance(v, str):
         v = normalize_string(v)
     else:
@@ -344,7 +337,6 @@ def build_where_from_key_inputs(key_cols, inputs_map):
         for kc in key_cols:
             v = inputs_map.get(kc, None)
             if v is None or v == "":
-                # match NULL or empty string (safe)
                 parts.append(f"({kc} IS NULL OR {kc} = '')")
             else:
                 esc = str(v).replace("'", "''")
@@ -371,16 +363,9 @@ def render_table_ui(tab, table_key):
     log_table = info["log"]
     required_cols = info["required_cols"]
     key_cols = info.get("key_col", required_cols[-1])  # may be str or list
-    # display-friendly key label
-    if isinstance(key_cols, (list, tuple)):
-        key_label = ", ".join(key_cols)
-    else:
-        key_label = key_cols
 
     with tab:
-        # -------------------------
-        # Approval Dashboard (per-table)
-        # -------------------------
+        # Approval Dashboard
         st.markdown("## Approval Dashboard")
         try:
             ensure_session()
@@ -408,7 +393,6 @@ def render_table_ui(tab, table_key):
 
             display_df["approve"] = st.session_state[approve_key]
 
-            # Make columns read-only except the approve checkbox
             column_config = {col: st.column_config.Column(disabled=True) for col in display_df.columns if col != "approve"}
             column_config["approve"] = st.column_config.CheckboxColumn("Approve", help="Tick to approve this record", width=80)
 
@@ -536,7 +520,6 @@ def render_table_ui(tab, table_key):
 
                             try:
                                 if act == "INSERT":
-                                    # Use keys from parsed_new if available; otherwise fallback to required_cols_local
                                     cols_from_new = list(parsed_new.keys()) if isinstance(parsed_new, dict) and parsed_new else required_cols_local
                                     vals_parts = []
                                     for col in cols_from_new:
@@ -561,7 +544,6 @@ def render_table_ui(tab, table_key):
                                         session.sql(update_sql).collect()
                                         processed += 1
                                     else:
-                                        # fallback to insert
                                         cols_from_new = list(parsed_new.keys()) if isinstance(parsed_new, dict) and parsed_new else required_cols_local
                                         vals_parts = []
                                         for col in cols_from_new:
@@ -595,7 +577,6 @@ def render_table_ui(tab, table_key):
                                             st.warning(msg)
                                             continue
                                 else:
-                                    # unknown action: insert
                                     cols_from_new = list(parsed_new.keys()) if isinstance(parsed_new, dict) and parsed_new else required_cols_local
                                     vals_parts = []
                                     for col in cols_from_new:
@@ -612,7 +593,7 @@ def render_table_ui(tab, table_key):
                                     session.sql(insert_sql).collect()
                                     processed += 1
 
-                                # mark log approved (prefer numeric log_id)
+                                # mark log approved
                                 try:
                                     if log_id is not None:
                                         try:
@@ -666,12 +647,9 @@ def render_table_ui(tab, table_key):
                             import streamlit.components.v1 as components
                             components.html("<script>window.location.reload()</script>", height=0)
 
-        # -------------------------
-        # Main Table Editable UI with explicit "Enable/Disable Editing" button
-        # -------------------------
+        # Main Table Editable UI
         st.markdown("---")
         st.subheader("Main Table: " + main_table)
-        # ensure session before fetching main table
         ensure_session()
         main_df = fetch_main_table_sorted(main_table)
 
@@ -680,29 +658,24 @@ def render_table_ui(tab, table_key):
         else:
             st.markdown("**Tip:** Toggle edit mode to change cells. Click **Send Edits to Approval** to push edits to TEMP & LOG (main table unchanged until approval).")
 
-            # session state key to control editability per-table
             edit_key = f"main_edit_enabled_{table_key}"
             if edit_key not in st.session_state:
                 st.session_state[edit_key] = False
 
-            # Toggle button
             toggle_label = "Disable Editing" if st.session_state[edit_key] else "Enable Editing"
             if st.button(toggle_label, key=f"btn_edit_{table_key}"):
                 st.session_state[edit_key] = not st.session_state[edit_key]
 
-            # show current mode
             if st.session_state[edit_key]:
                 st.success("Edit mode enabled — you can edit cells. Click the button again to disable editing.")
             else:
                 st.info("Edit mode disabled — table is read-only. Click 'Enable Editing' to allow edits.")
 
-            # Render the table: editable only when edit mode is enabled
             if AGGRID_AVAILABLE:
                 gb = GridOptionsBuilder.from_dataframe(main_df)
                 gb.configure_default_column(editable=bool(st.session_state[edit_key]), resizable=True, filter=True, sortable=True)
                 gb.configure_grid_options(domLayout='normal')
                 grid_opts = gb.build()
-
                 grid_resp = AgGrid(
                     main_df,
                     gridOptions=grid_opts,
@@ -716,10 +689,8 @@ def render_table_ui(tab, table_key):
                 )
                 edited_data = pd.DataFrame(grid_resp["data"])
             else:
-                # fallback to st.data_editor; configure columns editable based on edit mode (safe API)
                 column_config = {}
                 if not st.session_state[edit_key]:
-                    # edit mode is disabled → mark all columns readonly (disabled=True)
                     for c in main_df.columns:
                         column_config[c] = st.column_config.Column(disabled=True)
                     edited_data = st.data_editor(
@@ -730,7 +701,6 @@ def render_table_ui(tab, table_key):
                         key=f"data_editor_main_{table_key}"
                     )
                 else:
-                    # edit mode is enabled → data_editor is editable by default (no editable flag)
                     edited_data = st.data_editor(
                         main_df,
                         use_container_width=True,
@@ -738,13 +708,12 @@ def render_table_ui(tab, table_key):
                         key=f"data_editor_main_{table_key}"
                     )
 
-            # Button: Send Edits to Approval (existing logic) — uses get_row_key for composite keys
+            # Send Edits to Approval (paired-update logic)
             if st.button("Send Edits to Approval", key=f"send_edits_{table_key}"):
                 try:
                     orig = main_df.copy()
                     new = edited_data.copy()
 
-                    # Build index maps by composite or single key using get_row_key
                     orig_index = {}
                     new_index = {}
 
@@ -757,7 +726,6 @@ def render_table_ui(tab, table_key):
                             k = get_row_key(r, key_cols)
                             new_index[k] = r
 
-                    # Helper to detect empty key (tuple or string)
                     def is_empty_key(k):
                         if isinstance(k, tuple):
                             return all((str(p) == "" or str(p).lower() == "nan") for p in k)
@@ -765,7 +733,6 @@ def render_table_ui(tab, table_key):
                             return (k == "" or k.lower() == "nan")
                         return False
 
-                    # Initial classification
                     deleted_keys = [k for k in orig_index.keys() if k not in new_index.keys()]
                     inserted_keys = [k for k in new_index.keys() if (k not in orig_index.keys() or is_empty_key(k))]
                     updated_keys = []
@@ -784,10 +751,8 @@ def render_table_ui(tab, table_key):
                             if changed:
                                 updated_keys.append(k)
 
-                    # --- Pair deleted + inserted keys as updates when rows match on non-key columns ---
-                    paired_updates = []  # list of tuples (old_key, new_key)
+                    paired_updates = []
                     if deleted_keys and inserted_keys:
-                        # prepare list of non-key columns to compare
                         non_key_cols = [c for c in orig.columns if (not (isinstance(key_cols, (list, tuple)) and c in key_cols) and not (isinstance(key_cols, str) and c == key_cols))]
                         if not non_key_cols:
                             if isinstance(key_cols, (list, tuple)):
@@ -823,14 +788,12 @@ def render_table_ui(tab, table_key):
                     processed = 0
                     errors = []
 
-                    # Process paired updates first
+                    # Process paired updates
                     for old_k, new_k in paired_updates:
                         try:
                             orig_row = orig_index.get(old_k)
                             new_row = new_index.get(new_k)
-                            # Insert the new representation into TEMP
                             vals_list = []
-                            # use required_cols order for inserts to temp; if temp has additional columns, ensure CSV upload uses columns explicitly
                             for col in required_cols:
                                 v = get_series_value(new_row, col) if new_row is not None else None
                                 if v is None or v == "":
@@ -841,7 +804,6 @@ def render_table_ui(tab, table_key):
                             vals_sql = ", ".join(vals_list)
                             insert_temp_sql = "INSERT INTO " + temp_table + " (" + cols_sql + ") VALUES (" + vals_sql + ")"
                             session.sql(insert_temp_sql).collect()
-                            # Log as UPDATE with old and new dicts
                             old_d = {}
                             new_d = {}
                             for col in required_cols:
@@ -854,7 +816,7 @@ def render_table_ui(tab, table_key):
                         except Exception as e:
                             errors.append("Error processing paired update old_key=" + str(old_k) + " new_key=" + str(new_k) + ": " + str(e))
 
-                    # Process unchanged-key updates
+                    # Unchanged-key updates
                     for k in updated_keys:
                         try:
                             orig_row = orig_index.get(k)
@@ -870,7 +832,6 @@ def render_table_ui(tab, table_key):
                             vals_sql = ", ".join(vals_list)
                             insert_temp_sql = "INSERT INTO " + temp_table + " (" + cols_sql + ") VALUES (" + vals_sql + ")"
                             session.sql(insert_temp_sql).collect()
-                            # build dicts and log UPDATE
                             old_d = {}
                             new_d = {}
                             for col in required_cols:
@@ -883,7 +844,7 @@ def render_table_ui(tab, table_key):
                         except Exception as e:
                             errors.append("Error processing update key=" + str(k) + ": " + str(e))
 
-                    # Process pure inserts
+                    # Inserts
                     for ik in inserted_keys:
                         try:
                             new_row = new_index.get(ik)
@@ -904,7 +865,7 @@ def render_table_ui(tab, table_key):
                         except Exception as e:
                             errors.append("Error processing insert key=" + str(ik) + ": " + str(e))
 
-                    # Process pure deletes
+                    # Deletes
                     for dk in deleted_keys:
                         try:
                             old_row = orig_index.get(dk)
@@ -932,50 +893,93 @@ def render_table_ui(tab, table_key):
                 except Exception as e:
                     st.error("Error processing edits for approval: " + str(e))
 
-        # -------------------------
         # Upload / Manual Insert / Temp CRUD
-        # -------------------------
         st.markdown("---")
         st.markdown("### Upload Excel or CSV (Inserts into TEMP Table)")
+
+        # -------------------------
+        # Robust type-aware upload block (schema introspection + coercion)
+        # -------------------------
         uploaded_file = st.file_uploader("Upload for " + table_key, type=["xlsx", "csv"])
         if uploaded_file:
             ensure_session()
             excel_df = read_uploaded_file(uploaded_file)
             if excel_df is not None:
-                # Use columns present in uploaded file (uppercased) so DESCRIPTION is not dropped
+                # normalize incoming column names to upper-case (matching Snowflake)
                 excel_df.columns = [col.strip().upper() for col in excel_df.columns]
-                # columns to insert into temp: take intersection of excel columns and required columns,
-                # but prefer to include any columns present in file (to keep DESCRIPTION).
                 cols_in_file = list(excel_df.columns)
-                # decide cols_to_insert: prefer file columns, but ensure uppercase
-                cols_to_insert = cols_in_file
                 st.dataframe(excel_df.head())
 
-                # Validate: at least required columns are present
-                required_upper = [c.upper() for c in required_cols]
-                missing_required = [c for c in required_upper if c not in cols_to_insert]
-                if missing_required:
-                    st.error(f"Missing required columns in upload. Required: {required_upper} ; Missing: {missing_required}")
+                # fetch temp table metadata if possible (DB.SCHEMA.TABLE)
+                table_col_types = {}
+                try:
+                    parts = temp_table.split(".")
+                    if len(parts) == 3:
+                        db_name, schema_name, tbl_name = parts
+                        q = (
+                            "SELECT column_name, data_type FROM "
+                            f"{db_name}.information_schema.columns "
+                            f"WHERE table_name = '{tbl_name}' AND table_schema = '{schema_name}'"
+                        )
+                        cols_meta = session.sql(q).to_pandas()
+                        table_col_types = {r['COLUMN_NAME'].upper(): str(r['DATA_TYPE']).upper() for _, r in cols_meta.iterrows()}
+                    else:
+                        st.warning("Temp table name not in DB.SCHEMA.TABLE format; skipping schema introspection.")
+                except Exception as e:
+                    st.warning("Could not fetch temp table metadata; proceeding with file columns only. Error: " + str(e))
+                    table_col_types = {}
+
+                # decide which columns to insert
+                if table_col_types:
+                    cols_to_insert = [c for c in cols_in_file if c in table_col_types]
+                    if not cols_to_insert:
+                        st.error("None of the uploaded columns match columns in the TEMP table. Aborting upload.")
+                        cols_to_insert = []
                 else:
+                    cols_to_insert = cols_in_file
+
+                if cols_to_insert:
                     if st.button("Upload to TEMP for " + table_key):
                         inserted = 0
                         for _, row in excel_df.iterrows():
-                            cols_sql = ", ".join(cols_to_insert)
                             vals_list = []
                             for col in cols_to_insert:
-                                v = row.get(col, "")
-                                if isinstance(v, str):
-                                    v = normalize_string(v)
+                                raw_v = row.get(col, "")
+                                if isinstance(raw_v, str):
+                                    raw_v = normalize_string(raw_v)
                                 try:
-                                    if pd.isna(v):
-                                        v = None
+                                    if pd.isna(raw_v):
+                                        raw_v = None
                                 except Exception:
                                     pass
-                                if v is None or v == "":
+                                col_type = table_col_types.get(col, "")
+                                try:
+                                    if col_type and ("TIMESTAMP" in col_type or "DATE" in col_type or "TIME" in col_type):
+                                        dt = pd.to_datetime(raw_v, errors="coerce", dayfirst=False)
+                                        if pd.isna(dt):
+                                            vals_list.append("NULL")
+                                        else:
+                                            val_str = dt.strftime("%Y-%m-%d %H:%M:%S")
+                                            vals_list.append(sql_literal(val_str))
+                                    elif col_type and any(x in col_type for x in ("NUMBER", "INT", "DECIMAL", "NUMERIC", "FLOAT", "DOUBLE")):
+                                        try:
+                                            if raw_v is None or raw_v == "":
+                                                vals_list.append("NULL")
+                                            else:
+                                                num = float(raw_v)
+                                                vals_list.append(str(int(num)) if num.is_integer() else str(num))
+                                        except Exception:
+                                            vals_list.append("NULL")
+                                    else:
+                                        if raw_v is None or raw_v == "":
+                                            vals_list.append("NULL")
+                                        else:
+                                            sval = str(raw_v).replace("'", "''")
+                                            vals_list.append("'" + sval + "'")
+                                except Exception:
                                     vals_list.append("NULL")
-                                else:
-                                    sval = str(v).replace("'", "''")
-                                    vals_list.append("'" + sval + "'")
+
+                            cols_sql = ", ".join(cols_to_insert)
                             vals_sql = ", ".join(vals_list)
                             insert_sql = "INSERT INTO " + temp_table + " (" + cols_sql + ") VALUES (" + vals_sql + ")"
                             try:
@@ -983,12 +987,17 @@ def render_table_ui(tab, table_key):
                             except Exception as e:
                                 st.error("Insert to TEMP failed: " + str(e))
                                 continue
-                            # Build row dict for logging using columns we inserted (so DESCRIPTION retained)
+
                             row_dict = {c: clean_for_json(normalize_string(row.get(c)) if isinstance(row.get(c), str) else row.get(c)) for c in cols_to_insert}
-                            log_change(main_table, "INSERT", None, row_dict)
+                            try:
+                                log_change(main_table, "INSERT", None, row_dict)
+                            except Exception as e:
+                                st.warning("Failed to write log for inserted row: " + str(e))
                             inserted += 1
+
                         st.success(str(inserted) + " rows uploaded to TEMP table and logged.")
-        # Manual insert: keep existing behavior (but include DESCRIPTION if in required_cols)
+
+        # Manual insert
         st.subheader("Manual Insert into TEMP Table")
         with st.form("insert_form_" + table_key):
             inputs = {col: st.text_input(col) for col in required_cols}
@@ -1012,9 +1021,9 @@ def render_table_ui(tab, table_key):
                 except Exception as e:
                     st.error("Insert to TEMP failed: " + str(e))
 
+        # Update in TEMP
         st.subheader("Update Record (in TEMP Table)")
         with st.form("update_form_" + table_key):
-            # For composite keys show multiple inputs; else single input
             key_inputs = {}
             if isinstance(key_cols, (list, tuple)):
                 cols_ui = st.columns(len(key_cols))
@@ -1052,9 +1061,9 @@ def render_table_ui(tab, table_key):
                     except Exception as e:
                         st.error("Update in TEMP failed: " + str(e))
 
+        # Delete in TEMP
         st.subheader("Delete Record (from TEMP Table)")
         with st.form("delete_form_" + table_key):
-            # For composite keys show multiple inputs; else single input
             del_key_inputs = {}
             if isinstance(key_cols, (list, tuple)):
                 cols_ui = st.columns(len(key_cols))
@@ -1090,9 +1099,7 @@ def render_table_ui(tab, table_key):
             elif submit_del:
                 st.warning("Please confirm delete before proceeding.")
 
-# -------------------------
 # Tabs
-# -------------------------
 tab1, tab2 = st.tabs(["DDM_DOMAIN_VALUE", "DDM_XREF_DOMAIN_VALUE"])
 render_table_ui(tab1, "DDM_DOMAIN_VALUE")
 render_table_ui(tab2, "DDM_XREF_DOMAIN_VALUE")
