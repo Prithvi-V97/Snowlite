@@ -49,6 +49,7 @@ def ensure_session():
             st.stop()
             return False
 
+
 # Best-effort add openpyxl
 try:
     if session is not None:
@@ -62,6 +63,7 @@ def normalize_string(s):
     if s is None:
         return None
     if isinstance(s, str):
+        # replace NBSP, normalize spaces, strip
         s2 = s.replace("\u00A0", " ")
         s2 = re.sub(r"\s+", " ", s2).strip()
         return s2
@@ -187,7 +189,7 @@ def log_change(main_table_name, action, old_value=None, new_value=None):
     cleaned_old = clean_for_json(old_value) if old_value is not None else None
     cleaned_new = clean_for_json(new_value) if new_value is not None else None
     old_json = json.dumps(cleaned_old) if cleaned_old is not None else None
-    new_json = json.dumps(cleaned_new) if new_json is not None else None
+    new_json = json.dumps(cleaned_new) if cleaned_new is not None else None
     old_sql_val = "$$ " + old_json + " $$" if old_json is not None else "NULL"
     new_sql_val = "$$ " + new_json + " $$" if new_json is not None else "NULL"
     insert_sql = (
@@ -228,7 +230,6 @@ main_tables = {
             "FROMDOMAINVALUE",
             "DESCRIPTION",
         ],
-        "key_col": ["TARGETENTITY", "TARGETDOMAIN", "TARGETDOMAINVALUE", "FROMENTITY", "FROMDOMAIN", "FROMDOMAINVALUE"],
     },
 }
 
@@ -301,6 +302,7 @@ def get_row_key(row, key_cols):
     Return stable key for a row (tuple for composite keys, string for single).
     NORMALIZATION: remove NBSP, collapse spaces, UPPERCASE so keys match robustly.
     """
+
     def norm_value(v):
         if v is None:
             return ""
@@ -401,20 +403,6 @@ def build_where_from_key_inputs(key_cols, inputs_map):
     return " AND ".join(parts) if parts else None
 
 
-def build_where_from_dict(d):
-    """Build a WHERE clause from a dict of col->value; handles None as IS NULL."""
-    if not d or not isinstance(d, dict):
-        return None
-    parts = []
-    for k, v in d.items():
-        col = str(k).upper()
-        if v is None or (isinstance(v, str) and v.strip() == ""):
-            parts.append(f"{col} IS NULL")
-        else:
-            parts.append(f"{col} = {sql_literal(v)}")
-    return " AND ".join(parts) if parts else None
-
-
 # function defined before render_table_ui to avoid runtime errors
 def fetch_main_table_sorted(table_name):
     ensure_session()
@@ -484,13 +472,13 @@ def render_table_ui(tab, table_key):
                 height=300,
                 column_config=column_config,
                 hide_index=True,
-                key=f"data_editor_logs_{table_key}"
+                key=f"data_editor_logs_{table_key}",
             )
 
             if "approve" in edited_logs.columns:
                 st.session_state[approve_key] = list(edited_logs["approve"])
 
-            # Approve Selected Records handler
+            # Approve Selected Records handler (keeps previous approval logic)
             if st.button(f"Approve Selected Records for {table_key}"):
                 ensure_session()
                 try:
@@ -573,7 +561,6 @@ def render_table_ui(tab, table_key):
                             act = str(action_db).upper() if action_db is not None else "INSERT"
 
                             try:
-                                # Apply to main table according to action
                                 if act == "INSERT":
                                     cols_from_new = list(parsed_new.keys()) if isinstance(parsed_new, dict) and parsed_new else required_cols_local
                                     vals_parts = []
@@ -585,14 +572,6 @@ def render_table_ui(tab, table_key):
                                     insert_sql = "INSERT INTO " + main_table_name + " (" + ", ".join(cols_from_new) + ") VALUES (" + ", ".join(vals_parts) + ")"
                                     session.sql(insert_sql).collect()
                                     processed += 1
-
-                                    # clear temp row for this new value
-                                    try:
-                                        temp_where = build_where_from_dict(parsed_new)
-                                        if temp_where:
-                                            session.sql("DELETE FROM " + temp_table + " WHERE " + temp_where).collect()
-                                    except Exception as e:
-                                        errors.append(f"Could not clear TEMP for log_id={log_id}: {e}")
 
                                 elif act == "UPDATE":
                                     set_clause = None
@@ -615,17 +594,7 @@ def render_table_ui(tab, table_key):
                                         update_sql = "UPDATE " + main_table_name + " SET " + set_clause + " WHERE " + where_clause
                                         session.sql(update_sql).collect()
                                         processed += 1
-
-                                        # clear temp row for this new value
-                                        try:
-                                            temp_where = build_where_from_dict(parsed_new)
-                                            if temp_where:
-                                                session.sql("DELETE FROM " + temp_table + " WHERE " + temp_where).collect()
-                                        except Exception as e:
-                                            errors.append(f"Could not clear TEMP for log_id={log_id}: {e}")
-
                                     else:
-                                        # fallback: insert new if where clause insufficient
                                         cols_from_new = list(parsed_new.keys()) if isinstance(parsed_new, dict) and parsed_new else required_cols_local
                                         vals_parts = []
                                         for col in cols_from_new:
@@ -636,13 +605,6 @@ def render_table_ui(tab, table_key):
                                         insert_sql = "INSERT INTO " + main_table_name + " (" + ", ".join(cols_from_new) + ") VALUES (" + ", ".join(vals_parts) + ")"
                                         session.sql(insert_sql).collect()
                                         processed += 1
-
-                                        try:
-                                            temp_where = build_where_from_dict(parsed_new)
-                                            if temp_where:
-                                                session.sql("DELETE FROM " + temp_table + " WHERE " + temp_where).collect()
-                                        except Exception as e:
-                                            errors.append(f"Could not clear TEMP for log_id={log_id}: {e}")
 
                                 elif act == "DELETE":
                                     where_clause = None
@@ -658,16 +620,7 @@ def render_table_ui(tab, table_key):
                                         delete_sql = "DELETE FROM " + main_table_name + " WHERE " + where_clause
                                         session.sql(delete_sql).collect()
                                         processed += 1
-
-                                        # clear temp row for this delete
-                                        try:
-                                            temp_where = build_where_from_dict(parsed_old)
-                                            if temp_where:
-                                                session.sql("DELETE FROM " + temp_table + " WHERE " + temp_where).collect()
-                                        except Exception as e:
-                                            errors.append(f"Could not clear TEMP for log_id={log_id}: {e}")
                                     else:
-                                        # fallback: try parsed_new as where
                                         if isinstance(parsed_new, dict):
                                             where_parts = []
                                             for kcol, vcol in parsed_new.items():
@@ -679,12 +632,6 @@ def render_table_ui(tab, table_key):
                                             if where_clause2:
                                                 session.sql("DELETE FROM " + main_table_name + " WHERE " + where_clause2).collect()
                                                 processed += 1
-                                                try:
-                                                    temp_where = build_where_from_dict(parsed_new)
-                                                    if temp_where:
-                                                        session.sql("DELETE FROM " + temp_table + " WHERE " + temp_where).collect()
-                                                except Exception as e:
-                                                    errors.append(f"Could not clear TEMP for log_id={log_id}: {e}")
                                             else:
                                                 msg = f"Cannot determine WHERE clause for DELETE for log_id={log_id}; skipped."
                                                 errors.append(msg)
@@ -694,7 +641,6 @@ def render_table_ui(tab, table_key):
                                             errors.append(msg)
                                             st.warning(msg)
                                 else:
-                                    # default behavior - insert
                                     cols_from_new = list(parsed_new.keys()) if isinstance(parsed_new, dict) and parsed_new else required_cols_local
                                     vals_parts = []
                                     for col in cols_from_new:
@@ -705,12 +651,6 @@ def render_table_ui(tab, table_key):
                                     insert_sql = "INSERT INTO " + main_table_name + " (" + ", ".join(cols_from_new) + ") VALUES (" + ", ".join(vals_parts) + ")"
                                     session.sql(insert_sql).collect()
                                     processed += 1
-                                    try:
-                                        temp_where = build_where_from_dict(parsed_new)
-                                        if temp_where:
-                                            session.sql("DELETE FROM " + temp_table + " WHERE " + temp_where).collect()
-                                    except Exception as e:
-                                        errors.append(f"Could not clear TEMP for log_id={log_id}: {e}")
 
                                 # mark log approved
                                 try:
@@ -758,7 +698,7 @@ def render_table_ui(tab, table_key):
         if main_df is None or main_df.empty:
             st.info("Main table empty or could not be fetched.")
         else:
-            st.markdown("**Tip:** Click 'Enable Editing' to toggle edit mode. When edit mode is ON, you can edit cells. Click 'Send Edits to Approval' to send changed rows to TEMP & log them.")
+            st.markdown("**Tip:** Click 'Enable Editing' to toggle edit mode. When edit mode is ON, a leftmost checkbox column appears. Select rows you want to send for approval and then click 'Send Edits to Approval'.")
 
             edit_key = f"main_edit_enabled_{table_key}"
             if edit_key not in st.session_state:
@@ -769,58 +709,169 @@ def render_table_ui(tab, table_key):
                 st.session_state[edit_key] = not st.session_state[edit_key]
 
             if st.session_state[edit_key]:
-                st.success("Edit mode enabled — edit cells and then click 'Send Edits to Approval'.")
+                st.success("Edit mode enabled — select rows and edit cells.")
             else:
-                st.info("Edit mode disabled — table is read-only.")
+                st.info("Edit mode disabled — table is read-only (no select checkboxes).")
 
             # ------------------------
-            # Prepare display_df and editor
+            # Prepare display_df and editor with a leftmost select column (deduplicate columns)
+            # NOTE: select checkbox is added/displayed ONLY when edit mode is ON (edit_key).
             # ------------------------
             display_df = main_df.copy().reset_index(drop=True)
+            sel_col = "select_for_approval"
 
             # Remove duplicate columns if any (keep first occurrence)
             display_df = display_df.loc[:, ~display_df.columns.duplicated()]
 
-            # Column config: editable depends on edit mode
-            column_config = {}
-            for c in display_df.columns:
-                column_config[c] = st.column_config.Column(disabled=not bool(st.session_state[edit_key]))
+            # Persist edit state key (edit_key defined earlier)
+            if edit_key not in st.session_state:
+                st.session_state[edit_key] = False
 
-            # Render editor (AG-Grid preferred)
-            if AGGRID_AVAILABLE:
-                gb = GridOptionsBuilder.from_dataframe(display_df)
-                gb.configure_default_column(editable=bool(st.session_state[edit_key]), resizable=True, filter=True, sortable=True)
-                grid_opts = gb.build()
-                grid_resp = AgGrid(
-                    display_df,
-                    gridOptions=grid_opts,
-                    data_return_mode=DataReturnMode.FILTERED_AND_SORTED,
-                    update_mode=GridUpdateMode.MANUAL if st.session_state[edit_key] else GridUpdateMode.NO_UPDATE,
-                    fit_columns_on_grid_load=True,
-                    enable_enterprise_modules=False,
-                    allow_unsafe_jscode=False,
-                    theme="alpine",
-                    key=f"aggrid_main_{table_key}",
-                )
-                edited_data = pd.DataFrame(grid_resp["data"])
+            if st.session_state[edit_key]:
+                # Ensure select column is leftmost and exists
+                if sel_col not in display_df.columns:
+                    display_df.insert(0, sel_col, False)
+                else:
+                    cols = list(display_df.columns)
+                    cols = [c for c in cols if c != sel_col]
+                    cols.insert(0, sel_col)
+                    display_df = display_df[cols]
+
+                sel_state_key = f"select_state_{table_key}"
+                # Initialize persisted selection state if not present or length mismatch
+                if sel_state_key not in st.session_state or len(st.session_state[sel_state_key]) != len(display_df):
+                    st.session_state[sel_state_key] = list(display_df[sel_col].fillna(False).astype(bool))
+
+                # sync persisted selections back to frame
+                display_df[sel_col] = list(st.session_state[sel_state_key])
+
+                # Column config: select is editable checkbox, other columns editable/disabled based on edit mode
+                column_config = {}
+                for c in display_df.columns:
+                    if c == sel_col:
+                        # Checkbox editable only when edit mode is ON
+                        column_config[c] = st.column_config.CheckboxColumn("Select", help="Tick to include this row in Send Edits")
+                    else:
+                        # editable when edit mode ON
+                        column_config[c] = st.column_config.Column(disabled=not bool(st.session_state[edit_key]))
+
+                # Render editor (AG-Grid preferred) with select column editable
+                if AGGRID_AVAILABLE:
+                    gb = GridOptionsBuilder.from_dataframe(display_df)
+                    gb.configure_default_column(editable=bool(st.session_state[edit_key]), resizable=True, filter=True, sortable=True)
+                    # If select column present, configure it explicitly to be editable
+                    if sel_col in display_df.columns:
+                        try:
+                            gb.configure_column(sel_col, editable=True, header_name="Select")
+                        except Exception:
+                            pass
+                    grid_opts = gb.build()
+                    grid_resp = AgGrid(
+                        display_df,
+                        gridOptions=grid_opts,
+                        data_return_mode=DataReturnMode.FILTERED_AND_SORTED,
+                        update_mode=GridUpdateMode.MANUAL,
+                        fit_columns_on_grid_load=True,
+                        enable_enterprise_modules=False,
+                        allow_unsafe_jscode=False,
+                        theme="alpine",
+                        key=f"aggrid_main_{table_key}",
+                    )
+                    edited_data = pd.DataFrame(grid_resp["data"])
+                else:
+                    edited_data = st.data_editor(
+                        display_df,
+                        use_container_width=True,
+                        num_rows="dynamic",
+                        column_config=column_config,
+                        key=f"data_editor_main_{table_key}",
+                    )
+
+                # Defensive: remove duplicate columns returned by the editor (keep first occurrence)
+                if edited_data is not None and not edited_data.empty:
+                    edited_data = edited_data.loc[:, ~edited_data.columns.duplicated()]
+
+                # Persist selection state back to session (safe fallback)
+                if sel_col in edited_data.columns:
+                    st.session_state[sel_state_key] = list(edited_data[sel_col].fillna(False).astype(bool))
+                else:
+                    if sel_state_key not in st.session_state or len(st.session_state[sel_state_key]) != len(display_df):
+                        st.session_state[sel_state_key] = [False] * len(display_df)
+
             else:
-                edited_data = st.data_editor(
-                    display_df,
-                    use_container_width=True,
-                    num_rows="dynamic",
-                    column_config=column_config,
-                    key=f"data_editor_main_{table_key}",
-                )
+                # Edit mode is OFF — show read-only editor without any select column.
+                if sel_col in display_df.columns:
+                    display_df = display_df.drop(columns=[sel_col])
 
-            if edited_data is not None and not edited_data.empty:
-                edited_data = edited_data.loc[:, ~edited_data.columns.duplicated()]
+                column_config = {c: st.column_config.Column(disabled=True) for c in display_df.columns}
 
-            # --- Send Edits to Approval (detect diffs and send only changed rows) ---
+                if AGGRID_AVAILABLE:
+                    gb = GridOptionsBuilder.from_dataframe(display_df)
+                    gb.configure_default_column(editable=False, resizable=True, filter=True, sortable=True)
+                    grid_opts = gb.build()
+                    grid_resp = AgGrid(
+                        display_df,
+                        gridOptions=grid_opts,
+                        data_return_mode=DataReturnMode.FILTERED_AND_SORTED,
+                        update_mode=GridUpdateMode.NO_UPDATE,
+                        fit_columns_on_grid_load=True,
+                        enable_enterprise_modules=False,
+                        allow_unsafe_jscode=False,
+                        theme="alpine",
+                        key=f"aggrid_main_ro_{table_key}",
+                    )
+                    edited_data = pd.DataFrame(grid_resp["data"])
+                else:
+                    edited_data = st.data_editor(
+                        display_df,
+                        use_container_width=True,
+                        column_config=column_config,
+                        key=f"data_editor_main_ro_{table_key}",
+                    )
+
+                if edited_data is not None and not edited_data.empty:
+                    edited_data = edited_data.loc[:, ~edited_data.columns.duplicated()]
+
+            # ------------------------
+            # Robust helper to determine selection for a given key
+            # ------------------------
+            def determine_selection_for_key(k, candidate_row):
+                """Return boolean selection flag for key k:
+                1) try candidate_row.get(sel_col)
+                2) fallback: find index in display_df where keys match and use st.session_state[sel_state_key][idx]
+                """
+                sel_val = False
+                try:
+                    sel_val = bool(candidate_row.get(sel_col, False))
+                except Exception:
+                    sel_val = False
+                if sel_val:
+                    return True
+                # fallback to session_state by aligning keys in display_df
+                try:
+                    for idx, r in display_df.reset_index(drop=True).iterrows():
+                        if get_row_key(r, key_cols) == k:
+                            if (f"select_state_{table_key}") in st.session_state and idx < len(st.session_state[f"select_state_{table_key}"]):
+                                return bool(st.session_state[f"select_state_{table_key}"][idx])
+                            break
+                except Exception:
+                    pass
+                return False
+
+            # --- Send Edits to Approval (only sends rows that are selected AND actually changed) ---
             if st.button("Send Edits to Approval", key=f"send_edits_{table_key}"):
                 try:
                     ensure_session()
                     orig = main_df.copy().reset_index(drop=True)
                     new = edited_data.copy().reset_index(drop=True)
+
+                    # ensure select column present in new (if edit mode was on)
+                    sel_state_key = f"select_state_{table_key}"
+                    if st.session_state.get(edit_key, False) and "select_for_approval" not in new.columns:
+                        # If AG Grid returned columns differently, re-insert select values from session_state with alignment
+                        new.insert(0, "select_for_approval", [False] * len(new))
+                        if sel_state_key in st.session_state and len(st.session_state[sel_state_key]) == len(new):
+                            new["select_for_approval"] = st.session_state[sel_state_key]
 
                     # Normalize key columns in both orig and new before building indices so keys match robustly
                     def normalize_key_columns_in_df(df, key_cols_local):
@@ -865,13 +916,20 @@ def render_table_ui(tab, table_key):
                         vals_sql = ", ".join(vals)
                         session.sql("INSERT INTO " + temp_table + " (" + cols_sql + ") VALUES (" + vals_sql + ")").collect()
 
-                    # iterate over new rows and compare to orig, send changed rows
+                    # For every key present in new_index, if selected and changed => treat as UPDATE
                     for k, new_row in new_index.items():
                         try:
+                            sel_val = determine_selection_for_key(k, new_row)
+                            if not sel_val:
+                                continue
+                            # find old row (if exists)
                             old_row = orig_index.get(k)
                             if old_row is None:
+                                # Row not found in original - treat as update anyway (per your requirement),
+                                # capture old values as None and new values from new_row
                                 changed = True
                             else:
+                                # compare values for required_cols
                                 changed = False
                                 for c in required_cols:
                                     o_val = get_series_value(old_row, c)
@@ -890,21 +948,12 @@ def render_table_ui(tab, table_key):
                             if not changed:
                                 continue
 
-                            # ---------------------------
-                            # NEW: Build authoritative old_dict by querying MAIN table first
-                            # then fallback to in-memory old_row if DB fetch fails.
-                            # ---------------------------
+                            # Build old/new dicts (cleaned for JSON)
+                            # --- FIX: ALWAYS FETCH OLD VALUE FROM MAIN TABLE BEFORE LOGGING UPDATE ---
+                            old_dict = {}
 
-                            # Build new_dict from the edited row (always available)
-                            new_dict = {c: get_series_value(new_row, c) for c in required_cols}
-
-                            # -------------------------------------------------------
-                            # Fetch authoritative old_dict from MAIN TABLE (DB) using key columns
-                            # Fallback to in-memory old_row if DB fetch fails or returns no row
-                            # -------------------------------------------------------
-                            old_dict = {c: None for c in required_cols}
                             try:
-                                # Build key_inputs map using old_row if available else new_row values
+                                # Build WHERE clause based on key columns from *old_row* (fallback: new_row)
                                 key_inputs = {}
                                 if isinstance(key_cols, (list, tuple)):
                                     for kc in key_cols:
@@ -913,44 +962,39 @@ def render_table_ui(tab, table_key):
                                     key_inputs[key_cols] = get_series_value(old_row, key_cols) if old_row is not None else get_series_value(new_row, key_cols)
 
                                 where_clause = build_where_from_key_inputs(key_cols, key_inputs)
+
+                                # Fetch authoritative old row from MAIN table
                                 if where_clause:
-                                    sel_cols = ", ".join(required_cols)
-                                    sel_sql = "SELECT " + sel_cols + " FROM " + main_table + " WHERE " + where_clause + " LIMIT 1"
-                                    try:
-                                        fetched_df = session.sql(sel_sql).to_pandas()
-                                        if not fetched_df.empty:
-                                            fetched_row = fetched_df.iloc[0].to_dict()
-                                            # Map fetched_row values to required_cols (case-insensitive)
-                                            for c in required_cols:
-                                                val = None
-                                                for fk, fv in fetched_row.items():
-                                                    if str(fk).upper() == str(c).upper():
-                                                        val = fv
-                                                        break
-                                                # normalize strings (remove NBSP) and keep other types as-is
-                                                old_dict[c] = normalize_string(val) if isinstance(val, str) else clean_for_json(val)
-                                    except Exception:
-                                        # DB fetch failed — fallback to in-memory old_row below
-                                        pass
+                                    sel_sql = f"SELECT {', '.join(required_cols)} FROM {main_table} WHERE {where_clause} LIMIT 1"
+                                    fetched_df = session.sql(sel_sql).to_pandas()
 
-                                # If DB fetch didn't populate old_dict, fall back to in-memory `old_row`
-                                if all(old_dict[c] is None for c in required_cols):
-                                    if old_row is not None:
-                                        old_dict = {c: get_series_value(old_row, c) for c in required_cols}
+                                    if not fetched_df.empty:
+                                        # Use MAIN table's actual values
+                                        fetched_row = fetched_df.iloc[0]
+                                        for c in required_cols:
+                                            old_dict[c] = clean_for_json(get_series_value(fetched_row, c))
+                                    else:
+                                        # No matching row → fallback to UI old_row
+                                        old_dict = {c: clean_for_json(get_series_value(old_row, c)) for c in required_cols} \
+                                                if old_row is not None else {c: None for c in required_cols}
+
+                                else:
+                                    # WHERE clause failed → fallback
+                                    old_dict = {c: clean_for_json(get_series_value(old_row, c)) for c in required_cols} \
+                                            if old_row is not None else {c: None for c in required_cols}
+
                             except Exception:
-                                # any unexpected error: fallback to in-memory old_row or None
-                                try:
-                                    if old_row is not None:
-                                        old_dict = {c: get_series_value(old_row, c) for c in required_cols}
-                                except Exception:
-                                    old_dict = {c: None for c in required_cols}
-
-                            # Build cleaned_new_json for duplicate guard check
+                                # Absolute fallback (never break the flow)
+                                old_dict = {c: clean_for_json(get_series_value(old_row, c)) for c in required_cols} \
+                                        if old_row is not None else {c: None for c in required_cols}
+                            new_dict = {c: get_series_value(new_row, c) for c in required_cols}
                             cleaned_new_json = json.dumps(clean_for_json(new_dict))
 
-                            # Check duplicate pending log guard
+                            # Check if identical pending log already exists (to avoid double logging)
                             try:
+                                # Use parameter-free SQL but escape single quotes in table name (defensive)
                                 table_name_esc = str(main_table).replace("'", "''")
+                                # The new_value in logs is stored as $$ <json> $$ so we match that exact content
                                 check_sql = (
                                     "SELECT COUNT(1) AS CNT FROM " + log_table +
                                     " WHERE table_name = '" + table_name_esc + "'" +
@@ -963,18 +1007,24 @@ def render_table_ui(tab, table_key):
                                 existing_cnt = 0
 
                             if existing_cnt > 0:
+                                # Skip to avoid duplicate pending logs
+                                # (it implies this exact change has already been requested and is pending)
                                 errors.append(f"Skipped duplicate pending log for key={k}")
                                 continue
 
-                            # Insert changed row into TEMP and log as UPDATE
+                            # Insert changed row into TEMP (so approval pipeline picks it up)
                             insert_row_into_temp_from_series(new_row)
+
+                            # Log as UPDATE only
                             log_change(main_table, "UPDATE", old_dict, new_dict)
                             processed += 1
-
                         except Exception as e:
                             errors.append(f"Processing key={k} failed: {e}")
 
-                    st.success(f"Sent changed rows to TEMP and logged for approval. Processed: {processed}")
+                    # Note: Any rows present in orig but removed in new (deletes) will not be sent automatically
+                    # unless user selects them in some other flow. This preserves the desired behavior: edits -> UPDATE log.
+
+                    st.success(f"Sent selected edited rows to TEMP and logged for approval. Processed: {processed}")
                     if errors:
                         for er in errors:
                             st.warning(er)
@@ -1123,13 +1173,12 @@ def render_table_ui(tab, table_key):
                 else:
                     try:
                         escaped_new_value = "" if new_value is None else str(normalize_string(new_value)).replace("'", "''")
-                        # capture old before update
+                        session.sql("UPDATE " + temp_table + " SET " + upd_col + " = '" + escaped_new_value + "' WHERE " + where_clause).collect()
                         try:
                             old_df = session.sql("SELECT " + upd_col + " FROM " + temp_table + " WHERE " + where_clause).to_pandas()
                             old_val = old_df.iloc[0, 0] if not old_df.empty else None
                         except Exception:
                             old_val = None
-                        session.sql("UPDATE " + temp_table + " SET " + upd_col + " = '" + escaped_new_value + "' WHERE " + where_clause).collect()
                         log_change(main_table, "UPDATE", {upd_col: old_val}, {upd_col: new_value})
                         st.success("Record updated in TEMP and logged.")
                     except Exception as e:
