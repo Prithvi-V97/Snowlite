@@ -1,0 +1,527 @@
+# streamlit_app.py
+import re
+import json
+import ast
+import numpy as np
+import pandas as pd
+import streamlit as st
+from datetime import datetime, date
+from snowflake.snowpark.context import get_active_session
+
+# Optional enhanced grid
+try:
+    from st_aggrid import AgGrid, GridOptionsBuilder, GridUpdateMode, DataReturnMode
+    AGGRID_AVAILABLE = True
+except Exception:
+    AGGRID_AVAILABLE = False
+
+st.set_page_config(layout="wide")
+st.title("DDM Dual Table DML Dashboard")
+
+# -------------------------
+# Snowflake session
+# -------------------------
+try:
+    session = get_active_session()
+except Exception:
+    session = None
+
+# -------------------------
+# Helpers
+# -------------------------
+def ensure_session():
+    """Ensure a global Snowflake session is available."""
+    global session
+    try:
+        if session is None:
+            session = get_active_session()
+        session.sql("SELECT 1").collect()
+        return True
+    except Exception as e:
+        try:
+            session = get_active_session()
+            session.sql("SELECT 1").collect()
+            return True
+        except Exception as e2:
+            st.error("Database session expired or unavailable. Please refresh the app (F5).")
+            with st.expander("Technical details"):
+                st.text(str(e2))
+            st.stop()
+            return False
+
+# Best-effort add openpyxl
+try:
+    if session is not None:
+        session.add_packages("openpyxl")
+except Exception:
+    st.warning("Could not add openpyxl automatically. If Excel upload fails, use CSV instead.")
+
+def normalize_string(s):
+    """Strip NBSP and whitespace from strings, collapse multiple spaces, return None for empty."""
+    if s is None:
+        return None
+    if isinstance(s, str):
+        # replace NBSP, normalize spaces, strip
+        s2 = s.replace("\u00A0", " ")
+        s2 = re.sub(r"\s+", " ", s2).strip()
+        return s2
+    return s
+
+def read_uploaded_file(uploaded_file):
+    """Read uploaded .xlsx or .csv and normalize string cells."""
+    try:
+        name = uploaded_file.name.lower()
+        if name.endswith(".xlsx"):
+            df = pd.read_excel(uploaded_file, engine="openpyxl")
+        elif name.endswith(".csv"):
+            try:
+                df = pd.read_csv(uploaded_file, encoding="utf-8")
+            except UnicodeDecodeError:
+                st.warning("File not UTF-8 encoded. Trying ISO-8859-1...")
+                df = pd.read_csv(uploaded_file, encoding="ISO-8859-1")
+        else:
+            st.error("Unsupported file format. Please upload .xlsx or .csv")
+            return None
+        df = df.applymap(lambda x: normalize_string(x) if isinstance(x, str) else x)
+        return df
+    except Exception as e:
+        st.error("Error reading uploaded file: " + str(e))
+        return None
+
+def clean_for_json(obj):
+    """Make objects JSON-safe for storing in log table."""
+    if obj is None:
+        return None
+    try:
+        if pd.isna(obj):
+            return None
+    except Exception:
+        pass
+    if isinstance(obj, (pd.Timestamp, datetime)):
+        try:
+            return obj.isoformat()
+        except Exception:
+            return str(obj)
+    if isinstance(obj, date) and not isinstance(obj, datetime):
+        return obj.isoformat()
+    if isinstance(obj, (np.integer,)):
+        return int(obj)
+    if isinstance(obj, (np.floating,)):
+        return float(obj)
+    if isinstance(obj, (np.bool_,)):
+        return bool(obj)
+    if isinstance(obj, dict):
+        return {str(k): clean_for_json(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple, set, pd.Series)):
+        return [clean_for_json(v) for v in obj]
+    if isinstance(obj, (str, int, float, bool)):
+        return obj
+    try:
+        return str(obj)
+    except Exception:
+        return None
+
+def sql_literal(v):
+    """Return SQL literal for value v, or NULL."""
+    try:
+        if pd.isna(v):
+            return "NULL"
+    except Exception:
+        pass
+    if v is None:
+        return "NULL"
+    if isinstance(v, (int, float, np.integer, np.floating)) and not isinstance(v, (bool, np.bool_)):
+        return str(v)
+    s = str(v)
+    if re.fullmatch(r"-?\d+(\.\d+)?", s.strip()):
+        return s.strip()
+    return "'" + s.replace("'", "''") + "'"
+
+def parse_new_value(val):
+    """Try several parsing strategies for log new_value/old_value."""
+    if val is None:
+        return {}
+    if isinstance(val, dict):
+        return {k: (v.replace("\u00A0", " ").strip() if isinstance(v, str) else v) for k, v in val.items()}
+    s = str(val).strip()
+    if s.startswith("$$") and s.endswith("$$"):
+        s = s[2:-2].strip()
+    try:
+        parsed = json.loads(s)
+        if isinstance(parsed, dict):
+            return {k: (v.replace("\u00A0", " ").strip() if isinstance(v, str) else v) for k, v in parsed.items()}
+    except Exception:
+        pass
+    try:
+        parsed = json.loads(s.replace("'", '"'))
+        if isinstance(parsed, dict):
+            return {k: (v.replace("\u00A0", " ").strip() if isinstance(v, str) else v) for k, v in parsed.items()}
+    except Exception:
+        pass
+    try:
+        parsed = ast.literal_eval(s)
+        if isinstance(parsed, dict):
+            return {k: (v.replace("\u00A0", " ").strip() if isinstance(v, str) else v) for k, v in parsed.items()}
+    except Exception:
+        pass
+    return {}
+
+def find_log_table_for_main(main_table_name):
+    for info in main_tables.values():
+        if info.get("name") == main_table_name:
+            return info.get("log")
+    return None
+
+def log_change(main_table_name, action, old_value=None, new_value=None):
+    """Write a log row into the mapped log table."""
+    ensure_session()
+    log_table = find_log_table_for_main(main_table_name)
+    if not log_table:
+        raise ValueError(f"No log table mapping for main table {main_table_name}")
+    cleaned_old = clean_for_json(old_value) if old_value is not None else None
+    cleaned_new = clean_for_json(new_value) if new_value is not None else None
+    old_json = json.dumps(cleaned_old) if cleaned_old is not None else None
+    new_json = json.dumps(cleaned_new) if cleaned_new is not None else None
+    old_sql_val = "$$ " + old_json + " $$" if old_json is not None else "NULL"
+    new_sql_val = "$$ " + new_json + " $$" if new_json is not None else "NULL"
+    insert_sql = (
+        "INSERT INTO " + log_table + " "
+        "(action, table_name, old_value, new_value, changed_by, changed_at, approved) VALUES ("
+        + "'" + str(action) + "', "
+        + "'" + str(main_table_name) + "', "
+        + old_sql_val + ", " + new_sql_val + ", "
+        + "'streamlit_user', CURRENT_TIMESTAMP, FALSE)"
+    )
+    try:
+        session.sql(insert_sql).collect()
+    except Exception as e:
+        st.error("Failed to write to log table: " + str(e))
+
+# -------------------------
+# Table mappings
+# -------------------------
+main_tables = {
+    "DDM_DOMAIN_VALUE": {
+        "name": "OMNIDDM_TK270.COMMON.DDM_DOMAIN_VALUE",
+        "temp": "OMNIDDM_TK270.COMMON.DDM_DOMAIN_VALUE_TEMP",
+        "log":  "OMNIDDM_TK270.COMMON.DDM_DOMAIN_VALUE_LOG",
+        "required_cols": ["TARGETENTITY", "TARGETDOMAIN", "DOMAINVALUE", "DESCRIPTION"],
+        "key_col": ["TARGETENTITY", "TARGETDOMAIN", "DOMAINVALUE"]
+    },
+    "DDM_XREF_DOMAIN_VALUE": {
+        "name": "OMNIDDM_TK270.COMMON.DDM_XREF_DOMAIN_VALUE",
+        "temp": "OMNIDDM_TK270.COMMON.DDM_XREF_DOMAIN_VALUE_TEMP",
+        "log":  "OMNIDDM_TK270.COMMON.DDM_XREF_DOMAIN_VALUE_LOG",
+        "required_cols": ["TARGETENTITY", "TARGETDOMAIN", "TARGETDOMAINVALUE", "FROMENTITY", "FROMDOMAIN", "FROMDOMAINVALUE", "DESCRIPTION"]
+    }
+}
+
+def fetch_table_column_types(table_full_name):
+    """Return a mapping UPPERCASE column_name -> DATA_TYPE for the given table."""
+    ensure_session()
+    try:
+        parts = table_full_name.split(".")
+        if len(parts) == 3:
+            db_name, schema_name, tbl_name = parts
+            q = (
+                "SELECT column_name, data_type FROM "
+                f"{db_name}.information_schema.columns "
+                f"WHERE table_name = '{tbl_name}' AND table_schema = '{schema_name}'"
+            )
+            meta = session.sql(q).to_pandas()
+            return {r['COLUMN_NAME'].upper(): str(r['DATA_TYPE']).upper() for _, r in meta.iterrows()}
+    except Exception:
+        pass
+    return {}
+
+def coerce_value_for_column(col, raw_v, col_types):
+    """Coerce raw_v into SQL-ready literal depending on column type; handle time-only strings."""
+    try:
+        if isinstance(raw_v, str):
+            raw_v = normalize_string(raw_v)
+        try:
+            if pd.isna(raw_v):
+                raw_v = None
+        except Exception:
+            pass
+
+        dtype = col_types.get(col.upper(), "")
+
+        if dtype and ("TIMESTAMP" in dtype or "DATE" in dtype or "TIME" in dtype):
+            if raw_v is None or raw_v == "":
+                return "NULL"
+            dt = pd.to_datetime(raw_v, errors="coerce", dayfirst=False)
+            if pd.isna(dt):
+                time_only_pattern = r"^\s*\d{1,2}:\d{2}(?::\d{2}(?:\.\d+)?)?\s*$"
+                if isinstance(raw_v, str) and re.match(time_only_pattern, raw_v):
+                    today_str = datetime.now().strftime("%Y-%m-%d")
+                    candidate = f"{today_str} {raw_v}"
+                    dt = pd.to_datetime(candidate, errors="coerce", dayfirst=False)
+            if pd.isna(dt):
+                return "NULL"
+            val_str = dt.strftime("%Y-%m-%d %H:%M:%S")
+            return sql_literal(val_str)
+
+        if dtype and any(x in dtype for x in ("NUMBER", "INT", "DECIMAL", "NUMERIC", "FLOAT", "DOUBLE")):
+            if raw_v is None or raw_v == "":
+                return "NULL"
+            try:
+                num = float(raw_v)
+                return str(int(num)) if num.is_integer() else str(num)
+            except Exception:
+                return "NULL"
+
+        if raw_v is None or raw_v == "":
+            return "NULL"
+        return sql_literal(raw_v)
+    except Exception:
+        return "NULL"
+
+def get_row_key(row, key_cols):
+    """
+    Return stable key for a row (tuple for composite keys, string for single).
+    NORMALIZATION: remove NBSP, collapse spaces, UPPERCASE so keys match robustly.
+    """
+    def norm_value(v):
+        if v is None:
+            return ""
+        if isinstance(v, str):
+            v2 = normalize_string(v)
+            if v2 is None:
+                return ""
+            return v2.upper()
+        try:
+            if pd.isna(v):
+                return ""
+        except Exception:
+            pass
+        return str(v).upper()
+
+    if isinstance(key_cols, (list, tuple)):
+        parts = []
+        for k in key_cols:
+            v = None
+            # try case-sensitive access first
+            try:
+                v = row.get(k)
+            except Exception:
+                v = None
+            if v is None and hasattr(row, "index"):
+                # fallback case-insensitive
+                for colname in row.index:
+                    try:
+                        if str(colname).lower() == str(k).lower():
+                            v = row[colname]
+                            break
+                    except Exception:
+                        continue
+            parts.append(norm_value(v))
+        return tuple(parts)
+    else:
+        k = key_cols
+        v = None
+        try:
+            v = row.get(k)
+        except Exception:
+            v = None
+        if v is None and hasattr(row, "index"):
+            for colname in row.index:
+                try:
+                    if str(colname).lower() == str(k).lower():
+                        v = row[colname]
+                        break
+                    except Exception:
+                        continue
+        return norm_value(v)
+
+def get_series_value(series_row, col):
+    """Robustly get a value from a pandas Series row (case-insensitive fallback)."""
+    v = None
+    try:
+        v = series_row.get(col)
+    except Exception:
+        v = None
+    if v is None and hasattr(series_row, "index"):
+        for colname in series_row.index:
+            try:
+                if str(colname).lower() == str(col).lower():
+                    v = series_row[colname]
+                    break
+            except Exception:
+                continue
+    if isinstance(v, str):
+        v = normalize_string(v)
+    else:
+        try:
+            if pd.isna(v):
+                v = None
+        except Exception:
+            pass
+    return v
+
+def build_where_from_key_inputs(key_cols, inputs_map):
+    """Build WHERE clause from key inputs map."""
+    parts = []
+    if isinstance(key_cols, (list, tuple)):
+        for kc in key_cols:
+            v = inputs_map.get(kc, None)
+            if v is None or v == "":
+                parts.append(f"({kc} IS NULL OR {kc} = '')")
+            else:
+                esc = str(v).replace("'", "''")
+                parts.append(f"{kc} = '{esc}'")
+    else:
+        v = inputs_map.get(key_cols, None)
+        if v is None or v == "":
+            parts.append(f"({key_cols} IS NULL OR {key_cols} = '')")
+        else:
+            esc = str(v).replace("'", "''")
+            parts.append(f"{key_cols} = '{esc}'")
+    return " AND ".join(parts) if parts else None
+
+# function defined before render_table_ui to avoid runtime errors
+def fetch_main_table_sorted(table_name):
+    ensure_session()
+    try:
+        df = session.table(table_name).to_pandas()
+    except Exception:
+        return pd.DataFrame()
+    ts_candidates = [c for c in df.columns if c.lower() in ("approved_at", "changed_at", "created_at", "updated_at", "load_ts")]
+    if ts_candidates:
+        ts_col = ts_candidates[0]
+        try:
+            df[ts_col] = pd.to_datetime(df[ts_col], errors="coerce")
+            df = df.sort_values(by=ts_col, ascending=False).reset_index(drop=True)
+            return df
+        except Exception:
+            pass
+    return df.reset_index(drop=True)
+
+# -------------------------
+# Main per-table UI renderer
+# -------------------------
+def render_table_ui(tab, table_key):
+    ensure_session()
+
+    info = main_tables[table_key]
+    main_table = info["name"]
+    temp_table = info["temp"]
+    log_table = info["log"]
+    required_cols = info["required_cols"]
+    key_cols = info.get("key_col", required_cols[-1])
+
+    with tab:
+        # Approval Dashboard
+        st.markdown("## Approval Dashboard")
+        try:
+            logs_df = session.sql(f"SELECT * FROM {log_table} WHERE approved = FALSE").to_pandas()
+        except Exception as e:
+            st.error("Could not fetch pending logs: " + str(e))
+            logs_df = pd.DataFrame()
+
+        pending_count = len(logs_df)
+        st.markdown(f"### Pending Logs for {table_key} ({pending_count})")
+
+        if logs_df.empty:
+            st.success("No pending approvals.")
+        else:
+            logs_df.columns = [c.lower() for c in logs_df.columns]
+            display_cols = [c for c in logs_df.columns if c not in ["approved", "approved_by", "approved_at"]]
+            display_df = logs_df[display_cols].copy().reset_index(drop=True)
+
+            approve_key = f"approve_col_{table_key}"
+            if approve_key not in st.session_state or len(st.session_state[approve_key]) != len(display_df):
+                st.session_state[approve_key] = [False] * len(display_df)
+
+            if st.button("Select All Pending for Approval", key=f"select_all_{table_key}"):
+                st.session_state[approve_key] = [True] * len(display_df)
+
+            display_df["approve"] = st.session_state[approve_key]
+
+            column_config = {col: st.column_config.Column(disabled=True) for col in display_df.columns if col != "approve"}
+            column_config["approve"] = st.column_config.CheckboxColumn("Approve", help="Tick to approve this record", width=80)
+
+            edited_logs = st.data_editor(
+                display_df,
+                use_container_width=True,
+                height=300,
+                column_config=column_config,
+                hide_index=True,
+                key=f"data_editor_logs_{table_key}"
+            )
+
+            if "approve" in edited_logs.columns:
+                st.session_state[approve_key] = list(edited_logs["approve"])
+
+            # Approve Selected Records handler (keeps previous approval logic)
+            if st.button(f"Approve Selected Records for {table_key}"):
+                ensure_session()
+                try:
+                    logs_db = session.sql(f"SELECT * FROM {log_table} WHERE approved = FALSE").to_pandas()
+                except Exception as e:
+                    st.error("Could not fetch logs for approval: " + str(e))
+                    logs_db = pd.DataFrame()
+
+                if logs_db.empty:
+                    st.info("No pending logs at approval time.")
+                else:
+                    logs_db.columns = [c.lower() for c in logs_db.columns]
+
+                    def db_row_key(r):
+                        t = r.get("table_name") if r.get("table_name") is not None else ""
+                        a = r.get("action") if r.get("action") is not None else ""
+                        cb = r.get("changed_by") if r.get("changed_by") is not None else ""
+                        ch = r.get("changed_at")
+                        try:
+                            ch_iso = ch.isoformat() if hasattr(ch, "isoformat") else str(ch)
+                        except Exception:
+                            ch_iso = str(ch)
+                        return (str(t), str(a), str(cb), str(ch_iso))
+
+                    db_key_map = {}
+                    for _, r in logs_db.iterrows():
+                        key = db_row_key(r)
+                        db_key_map.setdefault(key, []).append(r)
+
+                    to_approve = edited_logs[edited_logs["approve"] == True]
+                    if to_approve.empty:
+                        st.warning("No rows selected for approval.")
+                    else:
+                        processed = 0
+                        errors = []
+
+                        for _, picked in to_approve.iterrows():
+                            table_name = picked.get("table_name")
+                            action = picked.get("action")
+                            changed_by = picked.get("changed_by")
+                            changed_at = picked.get("changed_at")
+                            try:
+                                changed_at_iso = changed_at.isoformat() if hasattr(changed_at, "isoformat") else str(changed_at)
+                            except Exception:
+                                changed_at_iso = str(changed_at)
+                            lookup_key = (str(table_name), str(action), str(changed_by), str(changed_at_iso))
+
+                            matched = db_key_map.get(lookup_key)
+                            if not matched:
+                                msg = "No matching DB log found for selected row: " + str(lookup_key)
+                                errors.append(msg)
+                                st.warning(msg)
+                                continue
+
+                            db_row = matched.pop(0)
+                            log_id = db_row.get("log_id")
+                            new_value_db = db_row.get("new_value")
+                            old_value_db = db_row.get("old_value")
+                            table_name_db = db_row.get("table_name")
+                            action_db = db_row.get("action")
+
+                            # find mapping
+                            main_info = None
+                            for k, inf in main_tables.items():
+                                if inf.get("name") == table_name_db:
+                                    main_info = inf
+                                    break
+                            if not main_info:
+                                msg = f"No main mapping found for {table_name_db} (log_id={log_id})"
+                                errors.append(msg)
+                          
