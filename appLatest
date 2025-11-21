@@ -49,12 +49,14 @@ def ensure_session():
             st.stop()
             return False
 
+
 # Best-effort add openpyxl
 try:
     if session is not None:
         session.add_packages("openpyxl")
 except Exception:
     st.warning("Could not add openpyxl automatically. If Excel upload fails, use CSV instead.")
+
 
 def normalize_string(s):
     """Strip NBSP and whitespace from strings, collapse multiple spaces, return None for empty."""
@@ -66,6 +68,7 @@ def normalize_string(s):
         s2 = re.sub(r"\s+", " ", s2).strip()
         return s2
     return s
+
 
 def read_uploaded_file(uploaded_file):
     """Read uploaded .xlsx or .csv and normalize string cells."""
@@ -87,6 +90,7 @@ def read_uploaded_file(uploaded_file):
     except Exception as e:
         st.error("Error reading uploaded file: " + str(e))
         return None
+
 
 def clean_for_json(obj):
     """Make objects JSON-safe for storing in log table."""
@@ -121,6 +125,7 @@ def clean_for_json(obj):
     except Exception:
         return None
 
+
 def sql_literal(v):
     """Return SQL literal for value v, or NULL."""
     try:
@@ -136,6 +141,7 @@ def sql_literal(v):
     if re.fullmatch(r"-?\d+(\.\d+)?", s.strip()):
         return s.strip()
     return "'" + s.replace("'", "''") + "'"
+
 
 def parse_new_value(val):
     """Try several parsing strategies for log new_value/old_value."""
@@ -166,11 +172,13 @@ def parse_new_value(val):
         pass
     return {}
 
+
 def find_log_table_for_main(main_table_name):
     for info in main_tables.values():
         if info.get("name") == main_table_name:
             return info.get("log")
     return None
+
 
 def log_change(main_table_name, action, old_value=None, new_value=None):
     """Write a log row into the mapped log table."""
@@ -197,6 +205,7 @@ def log_change(main_table_name, action, old_value=None, new_value=None):
     except Exception as e:
         st.error("Failed to write to log table: " + str(e))
 
+
 # -------------------------
 # Table mappings
 # -------------------------
@@ -204,17 +213,26 @@ main_tables = {
     "DDM_DOMAIN_VALUE": {
         "name": "OMNIDDM_TK270.COMMON.DDM_DOMAIN_VALUE",
         "temp": "OMNIDDM_TK270.COMMON.DDM_DOMAIN_VALUE_TEMP",
-        "log":  "OMNIDDM_TK270.COMMON.DDM_DOMAIN_VALUE_LOG",
+        "log": "OMNIDDM_TK270.COMMON.DDM_DOMAIN_VALUE_LOG",
         "required_cols": ["TARGETENTITY", "TARGETDOMAIN", "DOMAINVALUE", "DESCRIPTION"],
-        "key_col": ["TARGETENTITY", "TARGETDOMAIN", "DOMAINVALUE"]
+        "key_col": ["TARGETENTITY", "TARGETDOMAIN", "DOMAINVALUE"],
     },
     "DDM_XREF_DOMAIN_VALUE": {
         "name": "OMNIDDM_TK270.COMMON.DDM_XREF_DOMAIN_VALUE",
         "temp": "OMNIDDM_TK270.COMMON.DDM_XREF_DOMAIN_VALUE_TEMP",
-        "log":  "OMNIDDM_TK270.COMMON.DDM_XREF_DOMAIN_VALUE_LOG",
-        "required_cols": ["TARGETENTITY", "TARGETDOMAIN", "TARGETDOMAINVALUE", "FROMENTITY", "FROMDOMAIN", "FROMDOMAINVALUE", "DESCRIPTION"]
-    }
+        "log": "OMNIDDM_TK270.COMMON.DDM_XREF_DOMAIN_VALUE_LOG",
+        "required_cols": [
+            "TARGETENTITY",
+            "TARGETDOMAIN",
+            "TARGETDOMAINVALUE",
+            "FROMENTITY",
+            "FROMDOMAIN",
+            "FROMDOMAINVALUE",
+            "DESCRIPTION",
+        ],
+    },
 }
+
 
 def fetch_table_column_types(table_full_name):
     """Return a mapping UPPERCASE column_name -> DATA_TYPE for the given table."""
@@ -229,10 +247,11 @@ def fetch_table_column_types(table_full_name):
                 f"WHERE table_name = '{tbl_name}' AND table_schema = '{schema_name}'"
             )
             meta = session.sql(q).to_pandas()
-            return {r['COLUMN_NAME'].upper(): str(r['DATA_TYPE']).upper() for _, r in meta.iterrows()}
+            return {r["COLUMN_NAME"].upper(): str(r["DATA_TYPE"]).upper() for _, r in meta.iterrows()}
     except Exception:
         pass
     return {}
+
 
 def coerce_value_for_column(col, raw_v, col_types):
     """Coerce raw_v into SQL-ready literal depending on column type; handle time-only strings."""
@@ -277,11 +296,13 @@ def coerce_value_for_column(col, raw_v, col_types):
     except Exception:
         return "NULL"
 
+
 def get_row_key(row, key_cols):
     """
     Return stable key for a row (tuple for composite keys, string for single).
     NORMALIZATION: remove NBSP, collapse spaces, UPPERCASE so keys match robustly.
     """
+
     def norm_value(v):
         if v is None:
             return ""
@@ -330,9 +351,10 @@ def get_row_key(row, key_cols):
                     if str(colname).lower() == str(k).lower():
                         v = row[colname]
                         break
-                    except Exception:
-                        continue
+                except Exception:
+                    continue
         return norm_value(v)
+
 
 def get_series_value(series_row, col):
     """Robustly get a value from a pandas Series row (case-insensitive fallback)."""
@@ -359,6 +381,7 @@ def get_series_value(series_row, col):
             pass
     return v
 
+
 def build_where_from_key_inputs(key_cols, inputs_map):
     """Build WHERE clause from key inputs map."""
     parts = []
@@ -379,6 +402,7 @@ def build_where_from_key_inputs(key_cols, inputs_map):
             parts.append(f"{key_cols} = '{esc}'")
     return " AND ".join(parts) if parts else None
 
+
 # function defined before render_table_ui to avoid runtime errors
 def fetch_main_table_sorted(table_name):
     ensure_session()
@@ -396,6 +420,7 @@ def fetch_main_table_sorted(table_name):
         except Exception:
             pass
     return df.reset_index(drop=True)
+
 
 # -------------------------
 # Main per-table UI renderer
@@ -447,7 +472,7 @@ def render_table_ui(tab, table_key):
                 height=300,
                 column_config=column_config,
                 hide_index=True,
-                key=f"data_editor_logs_{table_key}"
+                key=f"data_editor_logs_{table_key}",
             )
 
             if "approve" in edited_logs.columns:
@@ -635,11 +660,11 @@ def render_table_ui(tab, table_key):
                                             session.sql("UPDATE " + log_table + " SET approved = TRUE, approved_by = 'business_user', approved_at = CURRENT_TIMESTAMP WHERE log_id = " + str(lid) + " AND approved = FALSE").collect()
                                         except Exception:
                                             table_name_esc = str(table_name_db).replace("'", "''")
-                                            changed_at_str = str(db_row.get('changed_at')).replace("'", "''")
+                                            changed_at_str = str(db_row.get("changed_at")).replace("'", "''")
                                             session.sql("UPDATE " + log_table + " SET approved = TRUE, approved_by = 'business_user', approved_at = CURRENT_TIMESTAMP WHERE table_name = '" + table_name_esc + "' AND changed_at = '" + changed_at_str + "'").collect()
                                     else:
                                         table_name_esc = str(table_name_db).replace("'", "''")
-                                        changed_at_str = str(db_row.get('changed_at')).replace("'", "''")
+                                        changed_at_str = str(db_row.get("changed_at")).replace("'", "''")
                                         session.sql("UPDATE " + log_table + " SET approved = TRUE, approved_by = 'business_user', approved_at = CURRENT_TIMESTAMP WHERE table_name = '" + table_name_esc + "' AND changed_at = '" + changed_at_str + "'").collect()
                                 except Exception as e:
                                     errors.append("Could not mark log approved for log_id=" + str(log_id) + ": " + str(e))
@@ -750,7 +775,7 @@ def render_table_ui(tab, table_key):
                         enable_enterprise_modules=False,
                         allow_unsafe_jscode=False,
                         theme="alpine",
-                        key=f"aggrid_main_{table_key}"
+                        key=f"aggrid_main_{table_key}",
                     )
                     edited_data = pd.DataFrame(grid_resp["data"])
                 else:
@@ -759,7 +784,7 @@ def render_table_ui(tab, table_key):
                         use_container_width=True,
                         num_rows="dynamic",
                         column_config=column_config,
-                        key=f"data_editor_main_{table_key}"
+                        key=f"data_editor_main_{table_key}",
                     )
 
                 # Defensive: remove duplicate columns returned by the editor (keep first occurrence)
@@ -793,7 +818,7 @@ def render_table_ui(tab, table_key):
                         enable_enterprise_modules=False,
                         allow_unsafe_jscode=False,
                         theme="alpine",
-                        key=f"aggrid_main_ro_{table_key}"
+                        key=f"aggrid_main_ro_{table_key}",
                     )
                     edited_data = pd.DataFrame(grid_resp["data"])
                 else:
@@ -801,7 +826,7 @@ def render_table_ui(tab, table_key):
                         display_df,
                         use_container_width=True,
                         column_config=column_config,
-                        key=f"data_editor_main_ro_{table_key}"
+                        key=f"data_editor_main_ro_{table_key}",
                     )
 
                 if edited_data is not None and not edited_data.empty:
@@ -1004,7 +1029,7 @@ def render_table_ui(tab, table_key):
                             f"{db_name}.information_schema.columns WHERE table_name = '{tbl_name}' AND table_schema = '{schema_name}'"
                         )
                         meta_df = session.sql(meta_q).to_pandas()
-                        table_col_types = {r['COLUMN_NAME'].upper(): str(r['DATA_TYPE']).upper() for _, r in meta_df.iterrows()}
+                        table_col_types = {r["COLUMN_NAME"].upper(): str(r["DATA_TYPE"]).upper() for _, r in meta_df.iterrows()}
                 except Exception:
                     table_col_types = {}
 
@@ -1156,6 +1181,7 @@ def render_table_ui(tab, table_key):
                             st.success("Record deleted from TEMP and logged.")
                         except Exception as e:
                             st.error("Delete failed: " + str(e))
+
 
 # Render tabs
 tab1, tab2 = st.tabs(["DDM_DOMAIN_VALUE", "DDM_XREF_DOMAIN_VALUE"])
