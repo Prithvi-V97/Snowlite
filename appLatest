@@ -381,24 +381,47 @@ def get_series_value(series_row, col):
 
 
 def build_where_from_key_inputs(key_cols, inputs_map):
-    """Build WHERE clause from key inputs map."""
+    """
+    Build WHERE clause from key inputs map.
+    - Normalizes input strings (strip NBSP, collapse spaces).
+    - Uses case-insensitive comparison: UPPER(col) = UPPER('value')
+    - For missing inputs returns None (caller should validate and show error)
+    """
+    def norm_for_sql(v):
+        if v is None:
+            return None
+        if isinstance(v, str):
+            s = v.replace("\u00A0", " ")
+            s = re.sub(r"\s+", " ", s).strip()
+            if s == "":
+                return None
+            return s
+        try:
+            if pd.isna(v):
+                return None
+        except Exception:
+            pass
+        return str(v)
+
     parts = []
     if isinstance(key_cols, (list, tuple)):
         for kc in key_cols:
-            v = inputs_map.get(kc, None)
-            if v is None or v == "":
-                parts.append(f"({kc} IS NULL OR {kc} = '')")
-            else:
-                esc = str(v).replace("'", "''")
-                parts.append(f"{kc} = '{esc}'")
-    else:
-        v = inputs_map.get(key_cols, None)
-        if v is None or v == "":
-            parts.append(f"({key_cols} IS NULL OR {key_cols} = '')")
-        else:
+            raw = inputs_map.get(kc, None)
+            v = norm_for_sql(raw)
+            if v is None:
+                # if any key part is missing, return None so caller can require full key
+                return None
             esc = str(v).replace("'", "''")
-            parts.append(f"{key_cols} = '{esc}'")
+            parts.append(f"UPPER({kc}) = UPPER('{esc}')")
+    else:
+        v = norm_for_sql(inputs_map.get(key_cols, None))
+        if v is None:
+            return None
+        esc = str(v).replace("'", "''")
+        parts.append(f"UPPER({key_cols}) = UPPER('{esc}')")
+
     return " AND ".join(parts) if parts else None
+
 
 
 def build_where_from_dict(d):
@@ -1084,23 +1107,44 @@ def render_table_ui(tab, table_key):
             new_value = st.text_input("New Value", key=f"newval_{table_key}")
             submit_upd = st.form_submit_button("Update Record")
             if submit_upd:
-                where_clause = build_where_from_key_inputs(key_cols, key_inputs)
-                if not where_clause:
-                    st.error("Could not build WHERE clause for update; provide key values.")
+                # Require full key input(s) to avoid accidental non-matches
+                missing_keys = []
+                if isinstance(key_cols, (list, tuple)):
+                    for kc in key_cols:
+                        if not key_inputs.get(kc) or str(key_inputs.get(kc)).strip() == "":
+                            missing_keys.append(kc)
                 else:
-                    try:
-                        escaped_new_value = "" if new_value is None else str(normalize_string(new_value)).replace("'", "''")
-                        # capture old before update
+                    if not key_inputs.get(key_cols) or str(key_inputs.get(key_cols)).strip() == "":
+                        missing_keys.append(key_cols)
+
+                if missing_keys:
+                    st.error("Please provide all key column values: " + ", ".join(missing_keys))
+                else:
+                    where_clause = build_where_from_key_inputs(key_cols, key_inputs)
+                    if not where_clause:
+                        st.error("Could not build WHERE clause for update; provide key values.")
+                    else:
                         try:
-                            old_df = session.sql("SELECT " + upd_col + " FROM " + temp_table + " WHERE " + where_clause).to_pandas()
-                            old_val = old_df.iloc[0, 0] if not old_df.empty else None
-                        except Exception:
-                            old_val = None
-                        session.sql("UPDATE " + temp_table + " SET " + upd_col + " = '" + escaped_new_value + "' WHERE " + where_clause).collect()
-                        log_change(main_table, "UPDATE", {upd_col: old_val}, {upd_col: new_value})
-                        st.success("Record updated in TEMP and logged.")
-                    except Exception as e:
-                        st.error("Update failed: " + str(e))
+                            escaped_new_value = "" if new_value is None else str(normalize_string(new_value)).replace("'", "''")
+                            # capture old before update (case-insensitive search via WHERE builder)
+                            try:
+                                old_df = session.sql("SELECT " + upd_col + " FROM " + temp_table + " WHERE " + where_clause).to_pandas()
+                                old_val = old_df.iloc[0, 0] if not old_df.empty else None
+                            except Exception:
+                                old_val = None
+
+                            # perform update
+                            result = session.sql("UPDATE " + temp_table + " SET " + upd_col + " = '" + escaped_new_value + "' WHERE " + where_clause).collect()
+                            # Log old value (normalize string if present)
+                            if isinstance(old_val, str):
+                                old_val_to_log = normalize_string(old_val)
+                            else:
+                                old_val_to_log = old_val
+                            log_change(main_table, "UPDATE", {upd_col: old_val_to_log}, {upd_col: new_value})
+                            st.success("Record updated in TEMP and logged.")
+                        except Exception as e:
+                            st.error("Update failed: " + str(e))
+
 
         # Delete in TEMP
         st.subheader("Delete Record (from TEMP Table)")
@@ -1120,22 +1164,36 @@ def render_table_ui(tab, table_key):
                 if not confirm:
                     st.warning("Please confirm delete before proceeding.")
                 else:
-                    where_clause = build_where_from_key_inputs(key_cols, del_key_inputs)
-                    if not where_clause:
-                        st.error("Could not build WHERE clause for delete; provide key values.")
+                    # Validate keys provided
+                    missing_keys = []
+                    if isinstance(key_cols, (list, tuple)):
+                        for kc in key_cols:
+                            if not del_key_inputs.get(kc) or str(del_key_inputs.get(kc)).strip() == "":
+                                missing_keys.append(kc)
                     else:
-                        try:
-                            old_val = None
+                        if not del_key_inputs.get(key_cols) or str(del_key_inputs.get(key_cols)).strip() == "":
+                            missing_keys.append(key_cols)
+
+                    if missing_keys:
+                        st.error("Please provide all key column values: " + ", ".join(missing_keys))
+                    else:
+                        where_clause = build_where_from_key_inputs(key_cols, del_key_inputs)
+                        if not where_clause:
+                            st.error("Could not build WHERE clause for delete; provide key values.")
+                        else:
                             try:
-                                old_df = session.sql("SELECT * FROM " + temp_table + " WHERE " + where_clause).to_pandas()
-                                old_val = old_df.to_dict(orient="records")[0] if not old_df.empty else None
-                            except Exception:
                                 old_val = None
-                            session.sql("DELETE FROM " + temp_table + " WHERE " + where_clause).collect()
-                            log_change(main_table, "DELETE", old_val, None)
-                            st.success("Record deleted from TEMP and logged.")
-                        except Exception as e:
-                            st.error("Delete failed: " + str(e))
+                                try:
+                                    old_df = session.sql("SELECT * FROM " + temp_table + " WHERE " + where_clause).to_pandas()
+                                    old_val = old_df.to_dict(orient="records")[0] if not old_df.empty else None
+                                except Exception:
+                                    old_val = None
+                                session.sql("DELETE FROM " + temp_table + " WHERE " + where_clause).collect()
+                                log_change(main_table, "DELETE", old_val, None)
+                                st.success("Record deleted from TEMP and logged.")
+                            except Exception as e:
+                                st.error("Delete failed: " + str(e))
+
 
 
 # Render tabs
