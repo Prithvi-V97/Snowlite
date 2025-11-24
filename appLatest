@@ -597,35 +597,19 @@ def render_table_ui(tab, table_key):
                                 elif act == "UPDATE":
                                     set_clause = None
                                     where_clause = None
-                                    # Build WHERE clause using KEY columns only
-                                    try:
-                                        key_inputs = {}
-                                        if isinstance(key_cols, (list, tuple)):
-                                            for kc in key_cols:
-                                                # Prefer old value, fallback to new value
-                                                key_inputs[kc] = parsed_old.get(kc) if parsed_old.get(kc) is not None else parsed_new.get(kc)
-                                        else:
-                                            key_inputs[key_cols] = parsed_old.get(key_cols) if parsed_old.get(key_cols) is not None else parsed_new.get(key_cols)
-
-                                        key_where = build_where_from_key_inputs(key_cols, key_inputs)
-                                        where_clause = key_where
-                                    except Exception as e:
-                                        st.error(f"Failed building key WHERE clause: {e}")
-                                        where_clause = None
-
                                     if isinstance(parsed_new, dict):
                                         set_parts = []
                                         for kcol, vcol in parsed_new.items():
                                             set_parts.append(f"{kcol.upper()} = {coerce_value_for_column(kcol, vcol, main_col_types)}")
                                         set_clause = ", ".join(set_parts) if set_parts else None
-                                    # if isinstance(parsed_old, dict):
-                                    #     where_parts = []
-                                    #     for kcol, vcol in parsed_old.items():
-                                    #         if vcol is None:
-                                    #             where_parts.append(f"{kcol.upper()} IS NULL")
-                                    #         else:
-                                    #             where_parts.append(f"{kcol.upper()} = {coerce_value_for_column(kcol, vcol, main_col_types)}")
-                                    #     where_clause = " AND ".join(where_parts) if where_parts else None
+                                    if isinstance(parsed_old, dict):
+                                        where_parts = []
+                                        for kcol, vcol in parsed_old.items():
+                                            if vcol is None:
+                                                where_parts.append(f"{kcol.upper()} IS NULL")
+                                            else:
+                                                where_parts.append(f"{kcol.upper()} = {coerce_value_for_column(kcol, vcol, main_col_types)}")
+                                        where_clause = " AND ".join(where_parts) if where_parts else None
 
                                     if set_clause and where_clause:
                                         update_sql = "UPDATE " + main_table_name + " SET " + set_clause + " WHERE " + where_clause
