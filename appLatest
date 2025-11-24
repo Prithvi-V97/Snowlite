@@ -2,7 +2,6 @@
 import re
 import json
 import ast
-import logging
 import numpy as np
 import pandas as pd
 import streamlit as st
@@ -16,9 +15,6 @@ try:
 except Exception:
     AGGRID_AVAILABLE = False
 
-# configure python logging (writes to console)
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
-
 st.set_page_config(layout="wide")
 st.title("DDM Dual Table DML Dashboard")
 
@@ -29,27 +25,6 @@ try:
     session = get_active_session()
 except Exception:
     session = None
-
-def exec_sql(sql):
-    """
-    Helper to execute SQL through session.sql(...).collect() while logging the SQL.
-    Logs to both Streamlit UI (st.markdown) and Python logging. Raises exception on failure.
-    """
-    if session is None:
-        raise RuntimeError("No active Snowflake session available for exec_sql.")
-    try:
-        try:
-            st.markdown(f"**Executing SQL:** `{sql}`")
-        except Exception:
-            st.write("Executing SQL:", sql)
-        logging.info("Executing SQL: %s", sql)
-        res = session.sql(sql).collect()
-        logging.info("SQL executed successfully.")
-        return res
-    except Exception as e:
-        logging.exception("SQL execution failed: %s", sql)
-        st.error(f"SQL execution failed: {e}")
-        raise
 
 # -------------------------
 # Helpers
@@ -195,24 +170,6 @@ def parse_new_value(val):
         pass
     return {}
 
-# NEW helper to avoid duplicating audit columns in INSERT
-def extend_with_audit_columns(cols_list, vals_list):
-    """
-    Given lists cols_list and vals_list (strings for SQL), return (cols_filtered, vals_filtered)
-    with audit columns removed from the incoming lists so they can be safely appended.
-    """
-    audit_cols = {"CADIS_SYSTEM_INSERTED", "CADIS_SYSTEM_UPDATED", "CADIS_SYSTEM_CHANGEDBY", "DSMNUMBER"}
-    cols_filtered = []
-    vals_filtered = []
-    for i, c in enumerate(cols_list):
-        try:
-            if str(c).upper() in audit_cols:
-                continue
-        except Exception:
-            pass
-        cols_filtered.append(c)
-        vals_filtered.append(vals_list[i])
-    return cols_filtered, vals_filtered
 
 def find_log_table_for_main(main_table_name):
     for info in main_tables.values():
@@ -230,7 +187,7 @@ def log_change(main_table_name, action, old_value=None, new_value=None):
     cleaned_old = clean_for_json(old_value) if old_value is not None else None
     cleaned_new = clean_for_json(new_value) if new_value is not None else None
     old_json = json.dumps(cleaned_old) if cleaned_old is not None else None
-    new_json = json.dumps(cleaned_new) if new_json is not None else None
+    new_json = json.dumps(cleaned_new) if cleaned_new is not None else None
     old_sql_val = "$$ " + old_json + " $$" if old_json is not None else "NULL"
     new_sql_val = "$$ " + new_json + " $$" if new_json is not None else "NULL"
     insert_sql = (
@@ -242,7 +199,7 @@ def log_change(main_table_name, action, old_value=None, new_value=None):
         + "'streamlit_user', CURRENT_TIMESTAMP, FALSE)"
     )
     try:
-        exec_sql(insert_sql)
+        session.sql(insert_sql).collect()
     except Exception as e:
         st.error("Failed to write to log table: " + str(e))
 
@@ -625,86 +582,61 @@ def render_table_ui(tab, table_key):
                                         if raw is None and isinstance(parsed_new, dict):
                                             raw = parsed_new.get(col.lower(), parsed_new.get(col.upper(), None))
                                         vals_parts.append(coerce_value_for_column(col, raw, main_col_types))
-
-                                    # Safe extend with audit columns (remove any audit cols from incoming lists first)
-                                    cols_clean, vals_clean = extend_with_audit_columns(cols_from_new, vals_parts)
-                                    cols_extended = cols_clean + ["CADIS_SYSTEM_INSERTED", "CADIS_SYSTEM_CHANGEDBY"]
-                                    vals_extended = vals_clean + ["CURRENT_TIMESTAMP", "'business_user'"]
-                                    insert_sql = "INSERT INTO " + main_table_name + " (" + ", ".join(cols_extended) + ") VALUES (" + ", ".join(vals_extended) + ")"
-                                    try:
-                                        exec_sql(insert_sql)
-                                    except Exception as e:
-                                        # Try fallback update if possible
-                                        logging.exception("Insert to main failed on approval; attempting fallback update: %s", e)
-                                        try:
-                                            # build fallback set_clause and where_clause from parsed_new/parsed_old if available
-                                            fallback_set = []
-                                            if isinstance(parsed_new, dict):
-                                                for kcol, vcol in parsed_new.items():
-                                                    fallback_set.append(f"{kcol.upper()} = {coerce_value_for_column(kcol, vcol, main_col_types)}")
-                                            fallback_set_clause = ", ".join(fallback_set) if fallback_set else None
-                                            fallback_where = None
-                                            if isinstance(parsed_old, dict):
-                                                where_parts = []
-                                                for kcol, vcol in parsed_old.items():
-                                                    if vcol is None:
-                                                        where_parts.append(f"{kcol.upper()} IS NULL")
-                                                    else:
-                                                        where_parts.append(f"{kcol.upper()} = {coerce_value_for_column(kcol, vcol, main_col_types)}")
-                                                fallback_where = " AND ".join(where_parts) if where_parts else None
-                                            if fallback_set_clause and fallback_where:
-                                                # append audit updates only if not already present
-                                                if "CADIS_SYSTEM_UPDATED" not in fallback_set_clause.upper():
-                                                    fallback_set_clause = fallback_set_clause + ", CADIS_SYSTEM_UPDATED = CURRENT_TIMESTAMP, CADIS_SYSTEM_CHANGEDBY = 'business_user'"
-                                                update_sql = "UPDATE " + main_table_name + " SET " + fallback_set_clause + " WHERE " + fallback_where
-                                                exec_sql(update_sql)
-                                                processed += 1
-                                            else:
-                                                errors.append(f"Insert failed and no fallback UPDATE available for log_id={log_id}: {e}")
-                                        except Exception as e2:
-                                            errors.append(f"Insert failed and fallback update failed for log_id={log_id}: {e2}")
-
-                                    else:
-                                        processed += 1
+                                    insert_sql = "INSERT INTO " + main_table_name + " (" + ", ".join(cols_from_new) + ") VALUES (" + ", ".join(vals_parts) + ")"
+                                    session.sql(insert_sql).collect()
+                                    processed += 1
 
                                     # clear temp row for this new value
                                     try:
                                         temp_where = build_where_from_dict(parsed_new)
                                         if temp_where:
-                                            exec_sql("DELETE FROM " + temp_table + " WHERE " + temp_where)
+                                            session.sql("DELETE FROM " + temp_table + " WHERE " + temp_where).collect()
                                     except Exception as e:
                                         errors.append(f"Could not clear TEMP for log_id={log_id}: {e}")
 
                                 elif act == "UPDATE":
                                     set_clause = None
                                     where_clause = None
+                                    # Build WHERE clause using KEY columns only
+                                    try:
+                                        key_inputs = {}
+                                        if isinstance(key_cols, (list, tuple)):
+                                            for kc in key_cols:
+                                                # Prefer old value, fallback to new value
+                                                key_inputs[kc] = parsed_old.get(kc) if parsed_old.get(kc) is not None else parsed_new.get(kc)
+                                        else:
+                                            key_inputs[key_cols] = parsed_old.get(key_cols) if parsed_old.get(key_cols) is not None else parsed_new.get(key_cols)
+
+                                        key_where = build_where_from_key_inputs(key_cols, key_inputs)
+                                        where_clause = key_where
+                                    except Exception as e:
+                                        st.error(f"Failed building key WHERE clause: {e}")
+                                        where_clause = None
+
                                     if isinstance(parsed_new, dict):
                                         set_parts = []
                                         for kcol, vcol in parsed_new.items():
                                             set_parts.append(f"{kcol.upper()} = {coerce_value_for_column(kcol, vcol, main_col_types)}")
                                         set_clause = ", ".join(set_parts) if set_parts else None
-                                    if isinstance(parsed_old, dict):
-                                        where_parts = []
-                                        for kcol, vcol in parsed_old.items():
-                                            if vcol is None:
-                                                where_parts.append(f"{kcol.upper()} IS NULL")
-                                            else:
-                                                where_parts.append(f"{kcol.upper()} = {coerce_value_for_column(kcol, vcol, main_col_types)}")
-                                        where_clause = " AND ".join(where_parts) if where_parts else None
+                                    # if isinstance(parsed_old, dict):
+                                    #     where_parts = []
+                                    #     for kcol, vcol in parsed_old.items():
+                                    #         if vcol is None:
+                                    #             where_parts.append(f"{kcol.upper()} IS NULL")
+                                    #         else:
+                                    #             where_parts.append(f"{kcol.upper()} = {coerce_value_for_column(kcol, vcol, main_col_types)}")
+                                    #     where_clause = " AND ".join(where_parts) if where_parts else None
 
                                     if set_clause and where_clause:
-                                        # append audit updates (avoid duplicate)
-                                        if "CADIS_SYSTEM_UPDATED" not in set_clause.upper():
-                                            set_clause = set_clause + ", CADIS_SYSTEM_UPDATED = CURRENT_TIMESTAMP, CADIS_SYSTEM_CHANGEDBY = 'business_user'"
                                         update_sql = "UPDATE " + main_table_name + " SET " + set_clause + " WHERE " + where_clause
-                                        exec_sql(update_sql)
+                                        session.sql(update_sql).collect()
                                         processed += 1
 
                                         # clear temp row for this new value
                                         try:
                                             temp_where = build_where_from_dict(parsed_new)
                                             if temp_where:
-                                                exec_sql("DELETE FROM " + temp_table + " WHERE " + temp_where)
+                                                session.sql("DELETE FROM " + temp_table + " WHERE " + temp_where).collect()
                                         except Exception as e:
                                             errors.append(f"Could not clear TEMP for log_id={log_id}: {e}")
 
@@ -717,49 +649,14 @@ def render_table_ui(tab, table_key):
                                             if raw is None and isinstance(parsed_new, dict):
                                                 raw = parsed_new.get(col.lower(), parsed_new.get(col.upper(), None))
                                             vals_parts.append(coerce_value_for_column(col, raw, main_col_types))
-
-                                        # Safe extend with audit columns for fallback insert
-                                        cols_clean, vals_clean = extend_with_audit_columns(cols_from_new, vals_parts)
-                                        cols_extended = cols_clean + ["CADIS_SYSTEM_INSERTED", "CADIS_SYSTEM_CHANGEDBY"]
-                                        vals_extended = vals_clean + ["CURRENT_TIMESTAMP", "'business_user'"]
-                                        insert_sql = "INSERT INTO " + main_table_name + " (" + ", ".join(cols_extended) + ") VALUES (" + ", ".join(vals_extended) + ")"
-                                        try:
-                                            exec_sql(insert_sql)
-                                        except Exception as e:
-                                            logging.exception("Fallback insert failed for UPDATE path; attempting fallback update: %s", e)
-                                            try:
-                                                # try to build a set_clause from parsed_new and where_clause from parsed_old
-                                                fb_set = []
-                                                if isinstance(parsed_new, dict):
-                                                    for kcol, vcol in parsed_new.items():
-                                                        fb_set.append(f"{kcol.upper()} = {coerce_value_for_column(kcol, vcol, main_col_types)}")
-                                                fb_set_clause = ", ".join(fb_set) if fb_set else None
-                                                fb_where = None
-                                                if isinstance(parsed_old, dict):
-                                                    where_parts = []
-                                                    for kcol, vcol in parsed_old.items():
-                                                        if vcol is None:
-                                                            where_parts.append(f"{kcol.upper()} IS NULL")
-                                                        else:
-                                                            where_parts.append(f"{kcol.upper()} = {coerce_value_for_column(kcol, vcol, main_col_types)}")
-                                                    fb_where = " AND ".join(where_parts) if where_parts else None
-                                                if fb_set_clause and fb_where:
-                                                    if "CADIS_SYSTEM_UPDATED" not in fb_set_clause.upper():
-                                                        fb_set_clause = fb_set_clause + ", CADIS_SYSTEM_UPDATED = CURRENT_TIMESTAMP, CADIS_SYSTEM_CHANGEDBY = 'business_user'"
-                                                    update_sql = "UPDATE " + main_table_name + " SET " + fb_set_clause + " WHERE " + fb_where
-                                                    exec_sql(update_sql)
-                                                    processed += 1
-                                                else:
-                                                    errors.append(f"Fallback insert failed and no fallback update possible for log_id={log_id}: {e}")
-                                            except Exception as e2:
-                                                errors.append(f"Fallback insert failed and fallback update failed for log_id={log_id}: {e2}")
-                                        else:
-                                            processed += 1
+                                        insert_sql = "INSERT INTO " + main_table_name + " (" + ", ".join(cols_from_new) + ") VALUES (" + ", ".join(vals_parts) + ")"
+                                        session.sql(insert_sql).collect()
+                                        processed += 1
 
                                         try:
                                             temp_where = build_where_from_dict(parsed_new)
                                             if temp_where:
-                                                exec_sql("DELETE FROM " + temp_table + " WHERE " + temp_where)
+                                                session.sql("DELETE FROM " + temp_table + " WHERE " + temp_where).collect()
                                         except Exception as e:
                                             errors.append(f"Could not clear TEMP for log_id={log_id}: {e}")
 
@@ -775,14 +672,14 @@ def render_table_ui(tab, table_key):
                                         where_clause = " AND ".join(where_parts) if where_parts else None
                                     if where_clause:
                                         delete_sql = "DELETE FROM " + main_table_name + " WHERE " + where_clause
-                                        exec_sql(delete_sql)
+                                        session.sql(delete_sql).collect()
                                         processed += 1
 
                                         # clear temp row for this delete
                                         try:
                                             temp_where = build_where_from_dict(parsed_old)
                                             if temp_where:
-                                                exec_sql("DELETE FROM " + temp_table + " WHERE " + temp_where)
+                                                session.sql("DELETE FROM " + temp_table + " WHERE " + temp_where).collect()
                                         except Exception as e:
                                             errors.append(f"Could not clear TEMP for log_id={log_id}: {e}")
                                     else:
@@ -796,12 +693,12 @@ def render_table_ui(tab, table_key):
                                                     where_parts.append(f"{kcol.upper()} = {coerce_value_for_column(kcol, vcol, main_col_types)}")
                                             where_clause2 = " AND ".join(where_parts) if where_parts else None
                                             if where_clause2:
-                                                exec_sql("DELETE FROM " + main_table_name + " WHERE " + where_clause2)
+                                                session.sql("DELETE FROM " + main_table_name + " WHERE " + where_clause2).collect()
                                                 processed += 1
                                                 try:
                                                     temp_where = build_where_from_dict(parsed_new)
                                                     if temp_where:
-                                                        exec_sql("DELETE FROM " + temp_table + " WHERE " + temp_where)
+                                                        session.sql("DELETE FROM " + temp_table + " WHERE " + temp_where).collect()
                                                 except Exception as e:
                                                     errors.append(f"Could not clear TEMP for log_id={log_id}: {e}")
                                             else:
@@ -821,63 +718,30 @@ def render_table_ui(tab, table_key):
                                         if raw is None and isinstance(parsed_new, dict):
                                             raw = parsed_new.get(col.lower(), parsed_new.get(col.upper(), None))
                                         vals_parts.append(coerce_value_for_column(col, raw, main_col_types))
-
-                                    cols_clean, vals_clean = extend_with_audit_columns(cols_from_new, vals_parts)
-                                    cols_extended = cols_clean + ["CADIS_SYSTEM_INSERTED", "CADIS_SYSTEM_CHANGEDBY"]
-                                    vals_extended = vals_clean + ["CURRENT_TIMESTAMP", "'business_user'"]
-                                    insert_sql = "INSERT INTO " + main_table_name + " (" + ", ".join(cols_extended) + ") VALUES (" + ", ".join(vals_extended) + ")"
+                                    insert_sql = "INSERT INTO " + main_table_name + " (" + ", ".join(cols_from_new) + ") VALUES (" + ", ".join(vals_parts) + ")"
+                                    session.sql(insert_sql).collect()
+                                    processed += 1
                                     try:
-                                        exec_sql(insert_sql)
+                                        temp_where = build_where_from_dict(parsed_new)
+                                        if temp_where:
+                                            session.sql("DELETE FROM " + temp_table + " WHERE " + temp_where).collect()
                                     except Exception as e:
-                                        # fallback attempt: build update
-                                        logging.exception("Default fallback insert failed: %s", e)
-                                        try:
-                                            fb_set = []
-                                            if isinstance(parsed_new, dict):
-                                                for kcol, vcol in parsed_new.items():
-                                                    fb_set.append(f"{kcol.upper()} = {coerce_value_for_column(kcol, vcol, main_col_types)}")
-                                            fb_set_clause = ", ".join(fb_set) if fb_set else None
-                                            fb_where = None
-                                            if isinstance(parsed_old, dict):
-                                                where_parts = []
-                                                for kcol, vcol in parsed_old.items():
-                                                    if vcol is None:
-                                                        where_parts.append(f"{kcol.upper()} IS NULL")
-                                                    else:
-                                                        where_parts.append(f"{kcol.upper()} = {coerce_value_for_column(kcol, vcol, main_col_types)}")
-                                                fb_where = " AND ".join(where_parts) if where_parts else None
-                                            if fb_set_clause and fb_where:
-                                                if "CADIS_SYSTEM_UPDATED" not in fb_set_clause.upper():
-                                                    fb_set_clause = fb_set_clause + ", CADIS_SYSTEM_UPDATED = CURRENT_TIMESTAMP, CADIS_SYSTEM_CHANGEDBY = 'business_user'"
-                                                exec_sql("UPDATE " + main_table_name + " SET " + fb_set_clause + " WHERE " + fb_where)
-                                                processed += 1
-                                            else:
-                                                errors.append(f"Default insert failed and no fallback update possible for log_id={log_id}: {e}")
-                                        except Exception as e2:
-                                            errors.append(f"Default insert failed and fallback update failed for log_id={log_id}: {e2}")
-                                    else:
-                                        processed += 1
-                                        try:
-                                            temp_where = build_where_from_dict(parsed_new)
-                                            if temp_where:
-                                                exec_sql("DELETE FROM " + temp_table + " WHERE " + temp_where)
-                                        except Exception as e:
-                                            errors.append(f"Could not clear TEMP for log_id={log_id}: {e}")
+                                        errors.append(f"Could not clear TEMP for log_id={log_id}: {e}")
 
                                 # mark log approved
                                 try:
                                     if log_id is not None:
                                         try:
                                             lid = int(log_id)
-                                            exec_sql("UPDATE " + log_table + " SET approved = TRUE, approved_by = 'business_user', approved_at = CURRENT_TIMESTAMP WHERE log_id = " + str(lid) + " AND approved = FALSE")
+                                            session.sql("UPDATE " + log_table + " SET approved = TRUE, approved_by = 'business_user', approved_at = CURRENT_TIMESTAMP WHERE log_id = " + str(lid) + " AND approved = FALSE").collect()
                                         except Exception:
                                             table_name_esc = str(table_name_db).replace("'", "''")
                                             changed_at_str = str(db_row.get("changed_at")).replace("'", "''")
-                                            exec_sql("UPDATE " + log_table + " SET approved = TRUE, approved_by = 'business_user', approved_at = CURRENT_TIMESTAMP WHERE table_name = '" + table_name_esc + "' AND changed_at = '" + changed_at_str + "'")
+                                            session.sql("UPDATE " + log_table + " SET approved = TRUE, approved_by = 'business_user', approved_at = CURRENT_TIMESTAMP WHERE table_name = '" + table_name_esc + "' AND changed_at = '" + changed_at_str + "'").collect()
                                     else:
                                         table_name_esc = str(table_name_db).replace("'", "''")
                                         changed_at_str = str(db_row.get("changed_at")).replace("'", "''")
-                                        exec_sql("UPDATE " + log_table + " SET approved = TRUE, approved_by = 'business_user', approved_at = CURRENT_TIMESTAMP WHERE table_name = '" + table_name_esc + "' AND changed_at = '" + changed_at_str + "'")
+                                        session.sql("UPDATE " + log_table + " SET approved = TRUE, approved_by = 'business_user', approved_at = CURRENT_TIMESTAMP WHERE table_name = '" + table_name_esc + "' AND changed_at = '" + changed_at_str + "'").collect()
                                 except Exception as e:
                                     errors.append("Could not mark log approved for log_id=" + str(log_id) + ": " + str(e))
 
@@ -928,32 +792,21 @@ def render_table_ui(tab, table_key):
             # ------------------------
             # Prepare display_df and editor
             # ------------------------
-            # keep a stable per-row id so we can map edited rows back to their original row even if keys changed
             display_df = main_df.copy().reset_index(drop=True)
-            display_df.insert(0, "__ROW_ID", display_df.index.astype(str))  # stable ID as string
 
             # Remove duplicate columns if any (keep first occurrence)
             display_df = display_df.loc[:, ~display_df.columns.duplicated()]
 
-            # Column config: editable depends on edit mode; make __ROW_ID non-editable
+            # Column config: editable depends on edit mode
             column_config = {}
             for c in display_df.columns:
-                if c == "__ROW_ID":
-                    column_config[c] = st.column_config.Column(disabled=True)
-                else:
-                    column_config[c] = st.column_config.Column(disabled=not bool(st.session_state[edit_key]))
+                column_config[c] = st.column_config.Column(disabled=not bool(st.session_state[edit_key]))
 
             # Render editor (AG-Grid preferred)
             if AGGRID_AVAILABLE:
                 gb = GridOptionsBuilder.from_dataframe(display_df)
-                # ensure __ROW_ID is not editable
                 gb.configure_default_column(editable=bool(st.session_state[edit_key]), resizable=True, filter=True, sortable=True)
-                # override __ROW_ID to non-editable in grid options
                 grid_opts = gb.build()
-                # set columnDefs to make __ROW_ID not editable if present
-                if "__ROW_ID" in display_df.columns:
-                    # modify grid_opts if possible (safe: we don't rely on advanced grid features)
-                    pass
                 grid_resp = AgGrid(
                     display_df,
                     gridOptions=grid_opts,
@@ -982,158 +835,150 @@ def render_table_ui(tab, table_key):
             if st.button("Send Edits to Approval", key=f"send_edits_{table_key}"):
                 try:
                     ensure_session()
-                    # Original snapshot with same __ROW_ID
                     orig = main_df.copy().reset_index(drop=True)
-                    orig.insert(0, "__ROW_ID", orig.index.astype(str))
-
                     new = edited_data.copy().reset_index(drop=True)
-                    # Ensure new contains __ROW_ID (it should because we provided it to the editor)
-                    if "__ROW_ID" not in new.columns:
-                        st.error("Internal error: edited data missing internal row id; cannot proceed.")
-                    else:
-                        # Build map original by row id for quick lookup
-                        orig_map = {}
-                        for _, r in orig.iterrows():
-                            rid = str(get_series_value(r, "__ROW_ID") if "__ROW_ID" in r.index else r.name)
-                            orig_map[rid] = r
 
-                        processed = 0
-                        errors = []
+                    # Normalize key columns in both orig and new before building indices so keys match robustly
+                    def normalize_key_columns_in_df(df, key_cols_local):
+                        df2 = df.copy()
+                        if isinstance(key_cols_local, (list, tuple)):
+                            for kc in key_cols_local:
+                                if kc in df2.columns:
+                                    df2[kc] = df2[kc].apply(lambda x: normalize_string(x) if isinstance(x, str) else x)
+                        else:
+                            if key_cols_local in df2.columns:
+                                df2[key_cols_local] = df2[key_cols_local].apply(lambda x: normalize_string(x) if isinstance(x, str) else x)
+                        return df2
 
-                        def insert_row_into_temp_from_series(series_row):
-                            cols_sql = ", ".join(required_cols)
-                            vals = []
-                            for c in required_cols:
-                                v = get_series_value(series_row, c)
-                                if v is None or v == "":
-                                    vals.append("NULL")
-                                else:
-                                    sval = str(v).replace("'", "''")
-                                    vals.append("'" + normalize_string(sval) + "'")
-                            vals_sql = ", ".join(vals)
-                            exec_sql("INSERT INTO " + temp_table + " (" + cols_sql + ") VALUES (" + vals_sql + ")")
+                    orig_norm = normalize_key_columns_in_df(orig, key_cols)
+                    new_norm = normalize_key_columns_in_df(new, key_cols)
 
-                        # iterate over edited rows and compare to the orig row by __ROW_ID
-                        for _, new_row in new.iterrows():
-                            try:
-                                rowid = get_series_value(new_row, "__ROW_ID") if "__ROW_ID" in new_row.index else None
-                                if rowid is None:
-                                    errors.append("Skipped edited row without internal id.")
-                                    continue
+                    # build index maps keyed by stable key
+                    orig_index = {}
+                    new_index = {}
+                    if not orig_norm.empty:
+                        for _, r in orig_norm.iterrows():
+                            k = get_row_key(r, key_cols)
+                            orig_index[k] = r
+                    if not new_norm.empty:
+                        for _, r in new_norm.iterrows():
+                            k = get_row_key(r, key_cols)
+                            new_index[k] = r
 
-                                orig_row = orig_map.get(str(rowid))
-                                # determine if changed by comparing required_cols values
+                    processed = 0
+                    errors = []
+
+                    def insert_row_into_temp_from_series(series_row):
+                        cols_sql = ", ".join(required_cols)
+                        vals = []
+                        for c in required_cols:
+                            v = get_series_value(series_row, c)
+                            if v is None or v == "":
+                                vals.append("NULL")
+                            else:
+                                sval = str(v).replace("'", "''")
+                                vals.append("'" + normalize_string(sval) + "'")
+                        vals_sql = ", ".join(vals)
+                        session.sql("INSERT INTO " + temp_table + " (" + cols_sql + ") VALUES (" + vals_sql + ")").collect()
+
+                    # iterate over new rows and compare to orig, send changed rows
+                    for k, new_row in new_index.items():
+                        try:
+                            old_row = orig_index.get(k)
+                            if old_row is None:
+                                changed = True
+                            else:
                                 changed = False
-                                if orig_row is None:
-                                    # If original row missing, treat as changed
-                                    changed = True
+                                for c in required_cols:
+                                    o_val = get_series_value(old_row, c)
+                                    n_val = get_series_value(new_row, c)
+                                    if isinstance(o_val, str):
+                                        o_cmp = normalize_string(o_val)
+                                    else:
+                                        o_cmp = o_val
+                                    if isinstance(n_val, str):
+                                        n_cmp = normalize_string(n_val)
+                                    else:
+                                        n_cmp = n_val
+                                    if o_cmp != n_cmp:
+                                        changed = True
+                                        break
+                            if not changed:
+                                continue
+
+                            # DB-first authoritative old_dict fetch (query MAIN table first, fallback to in-memory)
+                            old_dict = {c: None for c in required_cols}
+                            try:
+                                # build key_inputs: prefer values from old_row if present, otherwise use new_row values
+                                key_inputs = {}
+                                if isinstance(key_cols, (list, tuple)):
+                                    for kc in key_cols:
+                                        key_inputs[kc] = get_series_value(old_row, kc) if old_row is not None else get_series_value(new_row, kc)
                                 else:
-                                    for c in required_cols:
-                                        o_val = get_series_value(orig_row, c)
-                                        n_val = get_series_value(new_row, c)
-                                        if isinstance(o_val, str):
-                                            o_cmp = normalize_string(o_val)
-                                        else:
-                                            o_cmp = o_val
-                                        if isinstance(n_val, str):
-                                            n_cmp = normalize_string(n_val)
-                                        else:
-                                            n_cmp = n_val
-                                        if o_cmp != n_cmp:
-                                            changed = True
-                                            break
-                                if not changed:
-                                    continue
+                                    key_inputs[key_cols] = get_series_value(old_row, key_cols) if old_row is not None else get_series_value(new_row, key_cols)
 
-                                # DB-first authoritative old_dict fetch using original key values (prefer orig_row keys)
-                                old_dict = None
-                                try:
-                                    key_lookup = {}
-                                    if isinstance(key_cols, (list, tuple)):
-                                        for kc in key_cols:
-                                            # prefer orig_row (pre-edit keys), else fall back to values in new_row
-                                            if orig_row is not None:
-                                                key_lookup[kc] = get_series_value(orig_row, kc)
-                                            else:
-                                                key_lookup[kc] = get_series_value(new_row, kc)
-                                    else:
-                                        if orig_row is not None:
-                                            key_lookup[key_cols] = get_series_value(orig_row, key_cols)
-                                        else:
-                                            key_lookup[key_cols] = get_series_value(new_row, key_cols)
+                                where_clause = build_where_from_key_inputs(key_cols, key_inputs)
+                                if where_clause:
+                                    sel_sql = f"SELECT {', '.join(required_cols)} FROM {main_table} WHERE {where_clause} LIMIT 1"
+                                    try:
+                                        fetched_df = session.sql(sel_sql).to_pandas()
+                                        if not fetched_df.empty:
+                                            fetched_row = fetched_df.iloc[0].to_dict()
+                                            old_dict = {
+                                                c: normalize_string(fetched_row.get(c)) if isinstance(fetched_row.get(c), str)
+                                                else clean_for_json(fetched_row.get(c))
+                                                for c in required_cols
+                                            }
+                                    except Exception:
+                                        # DB fetch failed; will fall back below
+                                        pass
 
-                                    where_for_db = build_where_from_dict(key_lookup)
-                                    if where_for_db:
-                                        try:
-                                            sel_sql = "SELECT * FROM " + main_table + " WHERE " + where_for_db + " LIMIT 1"
-                                            try:
-                                                st.markdown(f"**Executing SQL:** `{sel_sql}`")
-                                            except Exception:
-                                                st.write("Executing SQL:", sel_sql)
-                                            logging.info("Executing SQL: %s", sel_sql)
-                                            sel_df = session.sql(sel_sql).to_pandas()
-                                            if not sel_df.empty:
-                                                rowrec = sel_df.iloc[0].to_dict()
-                                                # Normalize into required_cols order/keys
-                                                old_dict = {}
-                                                for c in required_cols:
-                                                    if c in rowrec:
-                                                        old_dict[c] = rowrec.get(c)
-                                                    elif c.lower() in rowrec:
-                                                        old_dict[c] = rowrec.get(c.lower())
-                                                    elif c.upper() in rowrec:
-                                                        old_dict[c] = rowrec.get(c.upper())
-                                                    else:
-                                                        old_dict[c] = None
-                                        except Exception:
-                                            old_dict = None
-                                except Exception:
-                                    old_dict = None
+                                # Fallback to in-memory old_row only if DB returned no row (or values were all None)
+                                if all(old_dict[c] is None for c in required_cols) and old_row is not None:
+                                    old_dict = {c: get_series_value(old_row, c) for c in required_cols}
 
-                                # Fallback: if DB didn't return a row, use the in-memory orig_row (if present)
-                                if old_dict is None:
-                                    if orig_row is not None:
-                                        old_dict = {c: get_series_value(orig_row, c) for c in required_cols}
-                                    else:
-                                        old_dict = {c: None for c in required_cols}
+                            except Exception:
+                                # Worst-case fallback: use in-memory old_row when available, else Nones
+                                if old_row is not None:
+                                    old_dict = {c: get_series_value(old_row, c) for c in required_cols}
+                                else:
+                                    old_dict = {c: None for c in required_cols}
 
-                                # Build new_dict from the edited row (always available)
-                                new_dict = {c: get_series_value(new_row, c) for c in required_cols}
+                            # ---------------------------
+                            # Build new_dict from the edited row (always available)
+                            new_dict = {c: get_series_value(new_row, c) for c in required_cols}
+                            cleaned_new_json = json.dumps(clean_for_json(new_dict))
 
-                                # Remove any internal fields (like __ROW_ID) from new_dict/old_dict (they aren't in required_cols but be safe)
-                                # cleaned_new_json will be used to check duplicates
-                                cleaned_new_json = json.dumps(clean_for_json(new_dict))
+                            # Check duplicate pending log guard
+                            try:
+                                table_name_esc = str(main_table).replace("'", "''")
+                                check_sql = (
+                                    "SELECT COUNT(1) AS CNT FROM " + log_table +
+                                    " WHERE table_name = '" + table_name_esc + "'" +
+                                    " AND approved = FALSE" +
+                                    " AND new_value = $$ " + cleaned_new_json + " $$"
+                                )
+                                cnt_df = session.sql(check_sql).to_pandas()
+                                existing_cnt = int(cnt_df.iloc[0, 0]) if not cnt_df.empty else 0
+                            except Exception:
+                                existing_cnt = 0
 
-                                # Check duplicate pending log guard
-                                try:
-                                    table_name_esc = str(main_table).replace("'", "''")
-                                    check_sql = (
-                                        "SELECT COUNT(1) AS CNT FROM " + log_table +
-                                        " WHERE table_name = '" + table_name_esc + "'" +
-                                        " AND approved = FALSE" +
-                                        " AND new_value = $$ " + cleaned_new_json + " $$"
-                                    )
-                                    cnt_df = session.sql(check_sql).to_pandas()
-                                    existing_cnt = int(cnt_df.iloc[0, 0]) if not cnt_df.empty else 0
-                                except Exception:
-                                    existing_cnt = 0
+                            if existing_cnt > 0:
+                                errors.append(f"Skipped duplicate pending log for key={k}")
+                                continue
 
-                                if existing_cnt > 0:
-                                    errors.append(f"Skipped duplicate pending log for rowid={rowid}")
-                                    continue
+                            # Insert changed row into TEMP and log as UPDATE
+                            insert_row_into_temp_from_series(new_row)
+                            log_change(main_table, "UPDATE", old_dict, new_dict)
+                            processed += 1
 
-                                # Insert changed row into TEMP and log as UPDATE (old_dict and new_dict)
-                                insert_row_into_temp_from_series(new_row)
-                                log_change(main_table, "UPDATE", old_dict, new_dict)
-                                processed += 1
+                        except Exception as e:
+                            errors.append(f"Processing key={k} failed: {e}")
 
-                            except Exception as e:
-                                errors.append(f"Processing rowid={rowid} failed: {e}")
-
-                        st.success(f"Sent changed rows to TEMP and logged for approval. Processed: {processed}")
-                        if errors:
-                            for er in errors:
-                                st.warning(er)
+                    st.success(f"Sent changed rows to TEMP and logged for approval. Processed: {processed}")
+                    if errors:
+                        for er in errors:
+                            st.warning(er)
 
                     # refresh UI
                     try:
@@ -1150,6 +995,7 @@ def render_table_ui(tab, table_key):
                 except Exception as e:
                     st.error("Error processing edits for approval: " + str(e))
 
+        # Upload / Manual Insert / Temp CRUD
         st.markdown("---")
         st.markdown("### Upload Excel or CSV (Inserts into TEMP Table)")
         uploaded_file = st.file_uploader(f"Upload for {table_key}", type=["xlsx", "csv"], key=f"uploader_{table_key}")
@@ -1224,7 +1070,7 @@ def render_table_ui(tab, table_key):
                             cols_sql = ", ".join(cols_to_insert)
                             vals_sql = ", ".join(vals)
                             try:
-                                exec_sql("INSERT INTO " + temp_table + " (" + cols_sql + ") VALUES (" + vals_sql + ")")
+                                session.sql("INSERT INTO " + temp_table + " (" + cols_sql + ") VALUES (" + vals_sql + ")").collect()
                                 row_dict = {c: clean_for_json(normalize_string(row.get(c)) if isinstance(row.get(c), str) else row.get(c)) for c in cols_to_insert}
                                 log_change(main_table, "INSERT", None, row_dict)
                                 inserted += 1
@@ -1250,7 +1096,7 @@ def render_table_ui(tab, table_key):
                         cleaned_vals.append("'" + str(v).replace("'", "''") + "'")
                 vals_sql = ", ".join(cleaned_vals)
                 try:
-                    exec_sql("INSERT INTO " + temp_table + " (" + cols_sql + ") VALUES (" + vals_sql + ")")
+                    session.sql("INSERT INTO " + temp_table + " (" + cols_sql + ") VALUES (" + vals_sql + ")").collect()
                     log_change(main_table, "INSERT", None, {k: normalize_string(v) if isinstance(v, str) else v for k, v in inputs.items()})
                     st.success("Record inserted into TEMP and logged.")
                 except Exception as e:
@@ -1277,44 +1123,16 @@ def render_table_ui(tab, table_key):
                     st.error("Could not build WHERE clause for update; provide key values.")
                 else:
                     try:
-                        # Fetch full existing row from TEMP (DB-first) to capture old state
-                        old_row = None
+                        escaped_new_value = "" if new_value is None else str(normalize_string(new_value)).replace("'", "''")
+                        # capture old before update
                         try:
-                            sel_q = "SELECT * FROM " + temp_table + " WHERE " + where_clause + " LIMIT 1"
-                            try:
-                                st.markdown(f"**Executing SQL:** `{sel_q}`")
-                            except Exception:
-                                st.write("Executing SQL:", sel_q)
-                            logging.info("Executing SQL: %s", sel_q)
-                            old_df = session.sql(sel_q).to_pandas()
-                            if not old_df.empty:
-                                old_row = old_df.to_dict(orient="records")[0]
+                            old_df = session.sql("SELECT " + upd_col + " FROM " + temp_table + " WHERE " + where_clause).to_pandas()
+                            old_val = old_df.iloc[0, 0] if not old_df.empty else None
                         except Exception:
-                            old_row = None
-
-                        if old_row is None:
-                            st.warning("No matching row found in TEMP to update; nothing logged.")
-                        else:
-                            # Build new_row from old_row but with the updated column set to new_value
-                            new_row = dict(old_row)  # shallow copy
-                            # Normalize new_value
-                            nv = new_value
-                            if isinstance(nv, str):
-                                nv = normalize_string(nv)
-                            try:
-                                if pd.isna(nv):
-                                    nv = None
-                            except Exception:
-                                pass
-                            new_row[upd_col] = nv
-
-                            # Perform the update on TEMP (use safe escaping for string)
-                            escaped_new_value = "" if new_value is None else str(normalize_string(new_value)).replace("'", "''")
-                            exec_sql("UPDATE " + temp_table + " SET " + upd_col + " = '" + escaped_new_value + "' WHERE " + where_clause)
-
-                            # Ensure we log full row old->new for approval
-                            log_change(main_table, "UPDATE", old_row, new_row)
-                            st.success("Record updated in TEMP and logged for approval.")
+                            old_val = None
+                        session.sql("UPDATE " + temp_table + " SET " + upd_col + " = '" + escaped_new_value + "' WHERE " + where_clause).collect()
+                        log_change(main_table, "UPDATE", {upd_col: old_val}, {upd_col: new_value})
+                        st.success("Record updated in TEMP and logged.")
                     except Exception as e:
                         st.error("Update failed: " + str(e))
 
@@ -1336,68 +1154,22 @@ def render_table_ui(tab, table_key):
                 if not confirm:
                     st.warning("Please confirm delete before proceeding.")
                 else:
-                    # Normalize and build a robust WHERE clause (case-insensitive, handles NULL/empty)
-                    try:
-                        where_parts = []
-                        for kc in (key_cols if isinstance(key_cols, (list, tuple)) else [key_cols]):
-                            raw_in = del_key_inputs.get(kc, None)
-                            if isinstance(raw_in, str):
-                                raw_in = normalize_string(raw_in)
-                            try:
-                                if pd.isna(raw_in):
-                                    raw_in = None
-                            except Exception:
-                                pass
-
-                            if raw_in is None or raw_in == "":
-                                # check for NULL or empty string
-                                where_parts.append(f"({kc} IS NULL OR {kc} = '')")
-                            else:
-                                esc = str(raw_in).replace("'", "''")
-                                # use upper() both sides for case-insensitive match
-                                where_parts.append(f"upper({kc}) = upper('{esc}')")
-
-                        if not where_parts:
-                            st.error("Could not build WHERE clause for delete; provide key values.")
-                        else:
-                            where_clause = " AND ".join(where_parts)
-
-                            # Fetch full row from TEMP (DB-first) to capture old_value for logging
+                    where_clause = build_where_from_key_inputs(key_cols, del_key_inputs)
+                    if not where_clause:
+                        st.error("Could not build WHERE clause for delete; provide key values.")
+                    else:
+                        try:
                             old_val = None
                             try:
-                                sel_q = "SELECT * FROM " + temp_table + " WHERE " + where_clause + " LIMIT 1"
-                                try:
-                                    st.markdown(f"**Executing SQL:** `{sel_q}`")
-                                except Exception:
-                                    st.write("Executing SQL:", sel_q)
-                                logging.info("Executing SQL: %s", sel_q)
-                                old_df = session.sql(sel_q).to_pandas()
-                                if not old_df.empty:
-                                    old_val = old_df.to_dict(orient="records")[0]
-                            except Exception as e:
-                                st.warning("Warning while fetching existing TEMP row: " + str(e))
+                                old_df = session.sql("SELECT * FROM " + temp_table + " WHERE " + where_clause).to_pandas()
+                                old_val = old_df.to_dict(orient="records")[0] if not old_df.empty else None
+                            except Exception:
                                 old_val = None
-
-                            # Perform delete from TEMP (so UI reflects deletion immediately)
-                            try:
-                                del_q = "DELETE FROM " + temp_table + " WHERE " + where_clause
-                                exec_sql(del_q)
-                            except Exception as e:
-                                st.error("Failed to delete from TEMP: " + str(e))
-                                old_val = None
-                                # don't proceed to log if delete failed
-                                raise
-
-                            # Log the delete with full old row (if available) so approval can delete from MAIN table.
-                            if old_val is not None:
-                                log_change(main_table, "DELETE", old_val, None)
-                                st.success("Record deleted from TEMP and logged for approval.")
-                            else:
-                                # still log with old_val = None so there's an audit trail, but warn that full old row wasn't captured
-                                log_change(main_table, "DELETE", None, None)
-                                st.warning("Record deleted from TEMP and logged, but full existing row could not be captured for the log (old_value is NULL).")
-                    except Exception as e:
-                        st.error("Delete failed: " + str(e))
+                            session.sql("DELETE FROM " + temp_table + " WHERE " + where_clause).collect()
+                            log_change(main_table, "DELETE", old_val, None)
+                            st.success("Record deleted from TEMP and logged.")
+                        except Exception as e:
+                            st.error("Delete failed: " + str(e))
 
 
 # Render tabs
