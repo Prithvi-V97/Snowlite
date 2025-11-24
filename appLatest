@@ -2,6 +2,7 @@
 import re
 import json
 import ast
+import logging
 import numpy as np
 import pandas as pd
 import streamlit as st
@@ -15,6 +16,9 @@ try:
 except Exception:
     AGGRID_AVAILABLE = False
 
+# configure python logging (writes to console)
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+
 st.set_page_config(layout="wide")
 st.title("DDM Dual Table DML Dashboard")
 
@@ -25,6 +29,27 @@ try:
     session = get_active_session()
 except Exception:
     session = None
+
+def exec_sql(sql):
+    """
+    Helper to execute SQL through session.sql(...).collect() while logging the SQL.
+    Logs to both Streamlit UI (st.markdown) and Python logging. Raises exception on failure.
+    """
+    if session is None:
+        raise RuntimeError("No active Snowflake session available for exec_sql.")
+    try:
+        try:
+            st.markdown(f"**Executing SQL:** `{sql}`")
+        except Exception:
+            st.write("Executing SQL:", sql)
+        logging.info("Executing SQL: %s", sql)
+        res = session.sql(sql).collect()
+        logging.info("SQL executed successfully.")
+        return res
+    except Exception as e:
+        logging.exception("SQL execution failed: %s", sql)
+        st.error(f"SQL execution failed: {e}")
+        raise
 
 # -------------------------
 # Helpers
@@ -199,7 +224,7 @@ def log_change(main_table_name, action, old_value=None, new_value=None):
         + "'streamlit_user', CURRENT_TIMESTAMP, FALSE)"
     )
     try:
-        session.sql(insert_sql).collect()
+        exec_sql(insert_sql)
     except Exception as e:
         st.error("Failed to write to log table: " + str(e))
 
@@ -582,15 +607,51 @@ def render_table_ui(tab, table_key):
                                         if raw is None and isinstance(parsed_new, dict):
                                             raw = parsed_new.get(col.lower(), parsed_new.get(col.upper(), None))
                                         vals_parts.append(coerce_value_for_column(col, raw, main_col_types))
-                                    insert_sql = "INSERT INTO " + main_table_name + " (" + ", ".join(cols_from_new) + ") VALUES (" + ", ".join(vals_parts) + ")"
-                                    session.sql(insert_sql).collect()
-                                    processed += 1
+
+                                    # include audit columns for main insert
+                                    cols_extended = cols_from_new + ["CADIS_SYSTEM_INSERTED", "CADIS_SYSTEM_CHANGEDBY"]
+                                    vals_extended = vals_parts + ["CURRENT_TIMESTAMP", "'business_user'"]
+                                    insert_sql = "INSERT INTO " + main_table_name + " (" + ", ".join(cols_extended) + ") VALUES (" + ", ".join(vals_extended) + ")"
+                                    try:
+                                        exec_sql(insert_sql)
+                                    except Exception as e:
+                                        # Try fallback update if possible
+                                        logging.exception("Insert to main failed on approval; attempting fallback update: %s", e)
+                                        try:
+                                            # build fallback set_clause and where_clause from parsed_new/parsed_old if available
+                                            fallback_set = []
+                                            if isinstance(parsed_new, dict):
+                                                for kcol, vcol in parsed_new.items():
+                                                    fallback_set.append(f"{kcol.upper()} = {coerce_value_for_column(kcol, vcol, main_col_types)}")
+                                            fallback_set_clause = ", ".join(fallback_set) if fallback_set else None
+                                            fallback_where = None
+                                            if isinstance(parsed_old, dict):
+                                                where_parts = []
+                                                for kcol, vcol in parsed_old.items():
+                                                    if vcol is None:
+                                                        where_parts.append(f"{kcol.upper()} IS NULL")
+                                                    else:
+                                                        where_parts.append(f"{kcol.upper()} = {coerce_value_for_column(kcol, vcol, main_col_types)}")
+                                                fallback_where = " AND ".join(where_parts) if where_parts else None
+                                            if fallback_set_clause and fallback_where:
+                                                # append audit updates
+                                                fallback_set_clause = fallback_set_clause + ", CADIS_SYSTEM_UPDATED = CURRENT_TIMESTAMP, CADIS_SYSTEM_CHANGEDBY = 'business_user'"
+                                                update_sql = "UPDATE " + main_table_name + " SET " + fallback_set_clause + " WHERE " + fallback_where
+                                                exec_sql(update_sql)
+                                                processed += 1
+                                            else:
+                                                errors.append(f"Insert failed and no fallback UPDATE available for log_id={log_id}: {e}")
+                                        except Exception as e2:
+                                            errors.append(f"Insert failed and fallback update failed for log_id={log_id}: {e2}")
+
+                                    else:
+                                        processed += 1
 
                                     # clear temp row for this new value
                                     try:
                                         temp_where = build_where_from_dict(parsed_new)
                                         if temp_where:
-                                            session.sql("DELETE FROM " + temp_table + " WHERE " + temp_where).collect()
+                                            exec_sql("DELETE FROM " + temp_table + " WHERE " + temp_where)
                                     except Exception as e:
                                         errors.append(f"Could not clear TEMP for log_id={log_id}: {e}")
 
@@ -612,15 +673,17 @@ def render_table_ui(tab, table_key):
                                         where_clause = " AND ".join(where_parts) if where_parts else None
 
                                     if set_clause and where_clause:
+                                        # append audit updates
+                                        set_clause = set_clause + ", CADIS_SYSTEM_UPDATED = CURRENT_TIMESTAMP, CADIS_SYSTEM_CHANGEDBY = 'business_user'"
                                         update_sql = "UPDATE " + main_table_name + " SET " + set_clause + " WHERE " + where_clause
-                                        session.sql(update_sql).collect()
+                                        exec_sql(update_sql)
                                         processed += 1
 
                                         # clear temp row for this new value
                                         try:
                                             temp_where = build_where_from_dict(parsed_new)
                                             if temp_where:
-                                                session.sql("DELETE FROM " + temp_table + " WHERE " + temp_where).collect()
+                                                exec_sql("DELETE FROM " + temp_table + " WHERE " + temp_where)
                                         except Exception as e:
                                             errors.append(f"Could not clear TEMP for log_id={log_id}: {e}")
 
@@ -633,14 +696,47 @@ def render_table_ui(tab, table_key):
                                             if raw is None and isinstance(parsed_new, dict):
                                                 raw = parsed_new.get(col.lower(), parsed_new.get(col.upper(), None))
                                             vals_parts.append(coerce_value_for_column(col, raw, main_col_types))
-                                        insert_sql = "INSERT INTO " + main_table_name + " (" + ", ".join(cols_from_new) + ") VALUES (" + ", ".join(vals_parts) + ")"
-                                        session.sql(insert_sql).collect()
-                                        processed += 1
+
+                                        # include audit columns for insert fallback
+                                        cols_extended = cols_from_new + ["CADIS_SYSTEM_INSERTED", "CADIS_SYSTEM_CHANGEDBY"]
+                                        vals_extended = vals_parts + ["CURRENT_TIMESTAMP", "'business_user'"]
+                                        insert_sql = "INSERT INTO " + main_table_name + " (" + ", ".join(cols_extended) + ") VALUES (" + ", ".join(vals_extended) + ")"
+                                        try:
+                                            exec_sql(insert_sql)
+                                        except Exception as e:
+                                            logging.exception("Fallback insert failed for UPDATE path; attempting fallback update: %s", e)
+                                            try:
+                                                # try to build a set_clause from parsed_new and where_clause from parsed_old
+                                                fb_set = []
+                                                if isinstance(parsed_new, dict):
+                                                    for kcol, vcol in parsed_new.items():
+                                                        fb_set.append(f"{kcol.upper()} = {coerce_value_for_column(kcol, vcol, main_col_types)}")
+                                                fb_set_clause = ", ".join(fb_set) if fb_set else None
+                                                fb_where = None
+                                                if isinstance(parsed_old, dict):
+                                                    where_parts = []
+                                                    for kcol, vcol in parsed_old.items():
+                                                        if vcol is None:
+                                                            where_parts.append(f"{kcol.upper()} IS NULL")
+                                                        else:
+                                                            where_parts.append(f"{kcol.upper()} = {coerce_value_for_column(kcol, vcol, main_col_types)}")
+                                                    fb_where = " AND ".join(where_parts) if where_parts else None
+                                                if fb_set_clause and fb_where:
+                                                    fb_set_clause = fb_set_clause + ", CADIS_SYSTEM_UPDATED = CURRENT_TIMESTAMP, CADIS_SYSTEM_CHANGEDBY = 'business_user'"
+                                                    update_sql = "UPDATE " + main_table_name + " SET " + fb_set_clause + " WHERE " + fb_where
+                                                    exec_sql(update_sql)
+                                                    processed += 1
+                                                else:
+                                                    errors.append(f"Fallback insert failed and no fallback update possible for log_id={log_id}: {e}")
+                                            except Exception as e2:
+                                                errors.append(f"Fallback insert failed and fallback update failed for log_id={log_id}: {e2}")
+                                        else:
+                                            processed += 1
 
                                         try:
                                             temp_where = build_where_from_dict(parsed_new)
                                             if temp_where:
-                                                session.sql("DELETE FROM " + temp_table + " WHERE " + temp_where).collect()
+                                                exec_sql("DELETE FROM " + temp_table + " WHERE " + temp_where)
                                         except Exception as e:
                                             errors.append(f"Could not clear TEMP for log_id={log_id}: {e}")
 
@@ -656,14 +752,14 @@ def render_table_ui(tab, table_key):
                                         where_clause = " AND ".join(where_parts) if where_parts else None
                                     if where_clause:
                                         delete_sql = "DELETE FROM " + main_table_name + " WHERE " + where_clause
-                                        session.sql(delete_sql).collect()
+                                        exec_sql(delete_sql)
                                         processed += 1
 
                                         # clear temp row for this delete
                                         try:
                                             temp_where = build_where_from_dict(parsed_old)
                                             if temp_where:
-                                                session.sql("DELETE FROM " + temp_table + " WHERE " + temp_where).collect()
+                                                exec_sql("DELETE FROM " + temp_table + " WHERE " + temp_where)
                                         except Exception as e:
                                             errors.append(f"Could not clear TEMP for log_id={log_id}: {e}")
                                     else:
@@ -677,12 +773,12 @@ def render_table_ui(tab, table_key):
                                                     where_parts.append(f"{kcol.upper()} = {coerce_value_for_column(kcol, vcol, main_col_types)}")
                                             where_clause2 = " AND ".join(where_parts) if where_parts else None
                                             if where_clause2:
-                                                session.sql("DELETE FROM " + main_table_name + " WHERE " + where_clause2).collect()
+                                                exec_sql("DELETE FROM " + main_table_name + " WHERE " + where_clause2)
                                                 processed += 1
                                                 try:
                                                     temp_where = build_where_from_dict(parsed_new)
                                                     if temp_where:
-                                                        session.sql("DELETE FROM " + temp_table + " WHERE " + temp_where).collect()
+                                                        exec_sql("DELETE FROM " + temp_table + " WHERE " + temp_where)
                                                 except Exception as e:
                                                     errors.append(f"Could not clear TEMP for log_id={log_id}: {e}")
                                             else:
@@ -702,30 +798,61 @@ def render_table_ui(tab, table_key):
                                         if raw is None and isinstance(parsed_new, dict):
                                             raw = parsed_new.get(col.lower(), parsed_new.get(col.upper(), None))
                                         vals_parts.append(coerce_value_for_column(col, raw, main_col_types))
-                                    insert_sql = "INSERT INTO " + main_table_name + " (" + ", ".join(cols_from_new) + ") VALUES (" + ", ".join(vals_parts) + ")"
-                                    session.sql(insert_sql).collect()
-                                    processed += 1
+
+                                    cols_extended = cols_from_new + ["CADIS_SYSTEM_INSERTED", "CADIS_SYSTEM_CHANGEDBY"]
+                                    vals_extended = vals_parts + ["CURRENT_TIMESTAMP", "'business_user'"]
+                                    insert_sql = "INSERT INTO " + main_table_name + " (" + ", ".join(cols_extended) + ") VALUES (" + ", ".join(vals_extended) + ")"
                                     try:
-                                        temp_where = build_where_from_dict(parsed_new)
-                                        if temp_where:
-                                            session.sql("DELETE FROM " + temp_table + " WHERE " + temp_where).collect()
+                                        exec_sql(insert_sql)
                                     except Exception as e:
-                                        errors.append(f"Could not clear TEMP for log_id={log_id}: {e}")
+                                        # fallback attempt: build update
+                                        logging.exception("Default fallback insert failed: %s", e)
+                                        try:
+                                            fb_set = []
+                                            if isinstance(parsed_new, dict):
+                                                for kcol, vcol in parsed_new.items():
+                                                    fb_set.append(f"{kcol.upper()} = {coerce_value_for_column(kcol, vcol, main_col_types)}")
+                                            fb_set_clause = ", ".join(fb_set) if fb_set else None
+                                            fb_where = None
+                                            if isinstance(parsed_old, dict):
+                                                where_parts = []
+                                                for kcol, vcol in parsed_old.items():
+                                                    if vcol is None:
+                                                        where_parts.append(f"{kcol.upper()} IS NULL")
+                                                    else:
+                                                        where_parts.append(f"{kcol.upper()} = {coerce_value_for_column(kcol, vcol, main_col_types)}")
+                                                fb_where = " AND ".join(where_parts) if where_parts else None
+                                            if fb_set_clause and fb_where:
+                                                fb_set_clause = fb_set_clause + ", CADIS_SYSTEM_UPDATED = CURRENT_TIMESTAMP, CADIS_SYSTEM_CHANGEDBY = 'business_user'"
+                                                exec_sql("UPDATE " + main_table_name + " SET " + fb_set_clause + " WHERE " + fb_where)
+                                                processed += 1
+                                            else:
+                                                errors.append(f"Default insert failed and no fallback update possible for log_id={log_id}: {e}")
+                                        except Exception as e2:
+                                            errors.append(f"Default insert failed and fallback update failed for log_id={log_id}: {e2}")
+                                    else:
+                                        processed += 1
+                                        try:
+                                            temp_where = build_where_from_dict(parsed_new)
+                                            if temp_where:
+                                                exec_sql("DELETE FROM " + temp_table + " WHERE " + temp_where)
+                                        except Exception as e:
+                                            errors.append(f"Could not clear TEMP for log_id={log_id}: {e}")
 
                                 # mark log approved
                                 try:
                                     if log_id is not None:
                                         try:
                                             lid = int(log_id)
-                                            session.sql("UPDATE " + log_table + " SET approved = TRUE, approved_by = 'business_user', approved_at = CURRENT_TIMESTAMP WHERE log_id = " + str(lid) + " AND approved = FALSE").collect()
+                                            exec_sql("UPDATE " + log_table + " SET approved = TRUE, approved_by = 'business_user', approved_at = CURRENT_TIMESTAMP WHERE log_id = " + str(lid) + " AND approved = FALSE")
                                         except Exception:
                                             table_name_esc = str(table_name_db).replace("'", "''")
                                             changed_at_str = str(db_row.get("changed_at")).replace("'", "''")
-                                            session.sql("UPDATE " + log_table + " SET approved = TRUE, approved_by = 'business_user', approved_at = CURRENT_TIMESTAMP WHERE table_name = '" + table_name_esc + "' AND changed_at = '" + changed_at_str + "'").collect()
+                                            exec_sql("UPDATE " + log_table + " SET approved = TRUE, approved_by = 'business_user', approved_at = CURRENT_TIMESTAMP WHERE table_name = '" + table_name_esc + "' AND changed_at = '" + changed_at_str + "'")
                                     else:
                                         table_name_esc = str(table_name_db).replace("'", "''")
                                         changed_at_str = str(db_row.get("changed_at")).replace("'", "''")
-                                        session.sql("UPDATE " + log_table + " SET approved = TRUE, approved_by = 'business_user', approved_at = CURRENT_TIMESTAMP WHERE table_name = '" + table_name_esc + "' AND changed_at = '" + changed_at_str + "'").collect()
+                                        exec_sql("UPDATE " + log_table + " SET approved = TRUE, approved_by = 'business_user', approved_at = CURRENT_TIMESTAMP WHERE table_name = '" + table_name_esc + "' AND changed_at = '" + changed_at_str + "'")
                                 except Exception as e:
                                     errors.append("Could not mark log approved for log_id=" + str(log_id) + ": " + str(e))
 
@@ -863,7 +990,7 @@ def render_table_ui(tab, table_key):
                                 sval = str(v).replace("'", "''")
                                 vals.append("'" + normalize_string(sval) + "'")
                         vals_sql = ", ".join(vals)
-                        session.sql("INSERT INTO " + temp_table + " (" + cols_sql + ") VALUES (" + vals_sql + ")").collect()
+                        exec_sql("INSERT INTO " + temp_table + " (" + cols_sql + ") VALUES (" + vals_sql + ")")
 
                     # iterate over new rows and compare to orig, send changed rows
                     for k, new_row in new_index.items():
@@ -904,7 +1031,13 @@ def render_table_ui(tab, table_key):
                                 where_for_db = build_where_from_dict(key_lookup)
                                 if where_for_db:
                                     try:
-                                        sel_df = session.sql("SELECT * FROM " + main_table + " WHERE " + where_for_db + " LIMIT 1").to_pandas()
+                                        sel_sql = "SELECT * FROM " + main_table + " WHERE " + where_for_db + " LIMIT 1"
+                                        try:
+                                            st.markdown(f"**Executing SQL:** `{sel_sql}`")
+                                        except Exception:
+                                            st.write("Executing SQL:", sel_sql)
+                                        logging.info("Executing SQL: %s", sel_sql)
+                                        sel_df = session.sql(sel_sql).to_pandas()
                                         if not sel_df.empty:
                                             rowrec = sel_df.iloc[0].to_dict()
                                             # Normalize into required_cols order/keys
@@ -981,7 +1114,6 @@ def render_table_ui(tab, table_key):
                 except Exception as e:
                     st.error("Error processing edits for approval: " + str(e))
 
-        # Upload / Manual Insert / Temp CRUD
         st.markdown("---")
         st.markdown("### Upload Excel or CSV (Inserts into TEMP Table)")
         uploaded_file = st.file_uploader(f"Upload for {table_key}", type=["xlsx", "csv"], key=f"uploader_{table_key}")
@@ -1056,7 +1188,7 @@ def render_table_ui(tab, table_key):
                             cols_sql = ", ".join(cols_to_insert)
                             vals_sql = ", ".join(vals)
                             try:
-                                session.sql("INSERT INTO " + temp_table + " (" + cols_sql + ") VALUES (" + vals_sql + ")").collect()
+                                exec_sql("INSERT INTO " + temp_table + " (" + cols_sql + ") VALUES (" + vals_sql + ")")
                                 row_dict = {c: clean_for_json(normalize_string(row.get(c)) if isinstance(row.get(c), str) else row.get(c)) for c in cols_to_insert}
                                 log_change(main_table, "INSERT", None, row_dict)
                                 inserted += 1
@@ -1082,7 +1214,7 @@ def render_table_ui(tab, table_key):
                         cleaned_vals.append("'" + str(v).replace("'", "''") + "'")
                 vals_sql = ", ".join(cleaned_vals)
                 try:
-                    session.sql("INSERT INTO " + temp_table + " (" + cols_sql + ") VALUES (" + vals_sql + ")").collect()
+                    exec_sql("INSERT INTO " + temp_table + " (" + cols_sql + ") VALUES (" + vals_sql + ")")
                     log_change(main_table, "INSERT", None, {k: normalize_string(v) if isinstance(v, str) else v for k, v in inputs.items()})
                     st.success("Record inserted into TEMP and logged.")
                 except Exception as e:
@@ -1112,7 +1244,13 @@ def render_table_ui(tab, table_key):
                         # Fetch full existing row from TEMP (DB-first) to capture old state
                         old_row = None
                         try:
-                            old_df = session.sql("SELECT * FROM " + temp_table + " WHERE " + where_clause + " LIMIT 1").to_pandas()
+                            sel_q = "SELECT * FROM " + temp_table + " WHERE " + where_clause + " LIMIT 1"
+                            try:
+                                st.markdown(f"**Executing SQL:** `{sel_q}`")
+                            except Exception:
+                                st.write("Executing SQL:", sel_q)
+                            logging.info("Executing SQL: %s", sel_q)
+                            old_df = session.sql(sel_q).to_pandas()
                             if not old_df.empty:
                                 old_row = old_df.to_dict(orient="records")[0]
                         except Exception:
@@ -1136,10 +1274,9 @@ def render_table_ui(tab, table_key):
 
                             # Perform the update on TEMP (use safe escaping for string)
                             escaped_new_value = "" if new_value is None else str(normalize_string(new_value)).replace("'", "''")
-                            session.sql("UPDATE " + temp_table + " SET " + upd_col + " = '" + escaped_new_value + "' WHERE " + where_clause).collect()
+                            exec_sql("UPDATE " + temp_table + " SET " + upd_col + " = '" + escaped_new_value + "' WHERE " + where_clause)
 
                             # Ensure we log full row old->new for approval
-                            # Convert any pandas Timestamps etc. to JSON-safe types via clean_for_json inside log_change
                             log_change(main_table, "UPDATE", old_row, new_row)
                             st.success("Record updated in TEMP and logged for approval.")
                     except Exception as e:
@@ -1163,29 +1300,69 @@ def render_table_ui(tab, table_key):
                 if not confirm:
                     st.warning("Please confirm delete before proceeding.")
                 else:
-                    where_clause = build_where_from_key_inputs(key_cols, del_key_inputs)
-                    if not where_clause:
-                        st.error("Could not build WHERE clause for delete; provide key values.")
-                    else:
-                        try:
-                            # Fetch full row from TEMP to capture old_value for logging
+                    # Normalize and build a robust WHERE clause (case-insensitive, handles NULL/empty)
+                    try:
+                        where_parts = []
+                        for kc in (key_cols if isinstance(key_cols, (list, tuple)) else [key_cols]):
+                            raw_in = del_key_inputs.get(kc, None)
+                            if isinstance(raw_in, str):
+                                raw_in = normalize_string(raw_in)
+                            try:
+                                if pd.isna(raw_in):
+                                    raw_in = None
+                            except Exception:
+                                pass
+
+                            if raw_in is None or raw_in == "":
+                                # check for NULL or empty string
+                                where_parts.append(f"({kc} IS NULL OR {kc} = '')")
+                            else:
+                                esc = str(raw_in).replace("'", "''")
+                                # use upper() both sides for case-insensitive match
+                                where_parts.append(f"upper({kc}) = upper('{esc}')")
+
+                        if not where_parts:
+                            st.error("Could not build WHERE clause for delete; provide key values.")
+                        else:
+                            where_clause = " AND ".join(where_parts)
+
+                            # Fetch full row from TEMP (DB-first) to capture old_value for logging
                             old_val = None
                             try:
-                                old_df = session.sql("SELECT * FROM " + temp_table + " WHERE " + where_clause + " LIMIT 1").to_pandas()
+                                sel_q = "SELECT * FROM " + temp_table + " WHERE " + where_clause + " LIMIT 1"
+                                try:
+                                    st.markdown(f"**Executing SQL:** `{sel_q}`")
+                                except Exception:
+                                    st.write("Executing SQL:", sel_q)
+                                logging.info("Executing SQL: %s", sel_q)
+                                old_df = session.sql(sel_q).to_pandas()
                                 if not old_df.empty:
                                     old_val = old_df.to_dict(orient="records")[0]
-                            except Exception:
+                            except Exception as e:
+                                st.warning("Warning while fetching existing TEMP row: " + str(e))
                                 old_val = None
 
-                            # Instead of immediately deleting from MAIN, we delete from TEMP and log the DELETE action.
-                            # The approval step will delete from MAIN when log is approved.
-                            session.sql("DELETE FROM " + temp_table + " WHERE " + where_clause).collect()
+                            # Perform delete from TEMP (so UI reflects deletion immediately)
+                            try:
+                                del_q = "DELETE FROM " + temp_table + " WHERE " + where_clause
+                                exec_sql(del_q)
+                            except Exception as e:
+                                st.error("Failed to delete from TEMP: " + str(e))
+                                old_val = None
+                                # don't proceed to log if delete failed
+                                raise
 
-                            # Log the delete with full old row (if available) so approval can delete from main table.
-                            log_change(main_table, "DELETE", old_val, None)
-                            st.success("Record deleted from TEMP and logged for approval.")
-                        except Exception as e:
-                            st.error("Delete failed: " + str(e))
+                            # Log the delete with full old row (if available) so approval can delete from MAIN table.
+                            if old_val is not None:
+                                log_change(main_table, "DELETE", old_val, None)
+                                st.success("Record deleted from TEMP and logged for approval.")
+                            else:
+                                # still log with old_val = None so there's an audit trail, but warn that full old row wasn't captured
+                                log_change(main_table, "DELETE", None, None)
+                                st.warning("Record deleted from TEMP and logged, but full existing row could not be captured for the log (old_value is NULL).")
+                    except Exception as e:
+                        st.error("Delete failed: " + str(e))
+
 
 # Render tabs
 tab1, tab2 = st.tabs(["DDM_DOMAIN_VALUE", "DDM_XREF_DOMAIN_VALUE"])
