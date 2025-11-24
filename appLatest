@@ -1124,7 +1124,7 @@ def render_table_ui(tab, table_key):
             new_value = st.text_input("New Value", key=f"newval_{table_key}")
             submit_upd = st.form_submit_button("Update Record")
             if submit_upd:
-                # Require full key input(s) to avoid accidental non-matches
+                # Validate all key inputs provided
                 missing_keys = []
                 if isinstance(key_cols, (list, tuple)):
                     for kc in key_cols:
@@ -1137,44 +1137,108 @@ def render_table_ui(tab, table_key):
                 if missing_keys:
                     st.error("Please provide all key column values: " + ", ".join(missing_keys))
                 else:
+                    # Build normalized WHERE for TEMP (and MAIN if needed)
                     where_clause = build_where_from_key_inputs(key_cols, key_inputs)
                     if not where_clause:
                         st.error("Could not build WHERE clause for update; provide key values.")
                     else:
                         try:
-                            # Normalize new value for SQL
-                            escaped_new_value = "" if new_value is None else str(normalize_string(new_value)).replace("'", "''")
-                            # 1) Fetch the existing row BEFORE updating (to capture old_value)
-                            sel_sql = "SELECT * FROM " + temp_table + " WHERE " + where_clause + " LIMIT 1"
-                            try:
-                                old_df = session.sql(sel_sql).to_pandas()
-                            except Exception:
-                                old_df = session.sql("SELECT * FROM " + temp_table + " WHERE " + where_clause).to_pandas()
+                            # Normalize new value for insertion
+                            new_val_normalized = "" if new_value is None else str(normalize_string(new_value)).replace("'", "''")
 
-                            if old_df is None or old_df.empty:
-                                st.error("No matching row found in TEMP for the provided key values. Update aborted.")
-                            else:
-                                # Get the old value for the column being updated
+                            # 1) Try to find row in TEMP
+                            sel_temp_sql = "SELECT * FROM " + temp_table + " WHERE " + where_clause + " LIMIT 1"
+                            try:
+                                temp_df = session.sql(sel_temp_sql).to_pandas()
+                            except Exception:
+                                temp_df = session.sql("SELECT * FROM " + temp_table + " WHERE " + where_clause).to_pandas()
+
+                            if temp_df is not None and not temp_df.empty:
+                                # Row exists in TEMP -> update TEMP and log UPDATE with old value from TEMP
                                 old_val = None
                                 try:
-                                    old_val = old_df.iloc[0].get(upd_col)
+                                    old_val = temp_df.iloc[0].get(upd_col)
                                 except Exception:
-                                    old_val = old_df.iloc[0].to_dict().get(upd_col)
+                                    old_val = temp_df.iloc[0].to_dict().get(upd_col)
 
-                                # Perform the update
-                                update_sql = "UPDATE " + temp_table + " SET " + upd_col + " = '" + escaped_new_value + "' WHERE " + where_clause
+                                # perform update on TEMP
+                                update_sql = "UPDATE " + temp_table + " SET " + upd_col + " = '" + new_val_normalized + "' WHERE " + where_clause
                                 session.sql(update_sql).collect()
 
-                                # Verify update applied in TEMP (simple SELECT)
-                                verify_df = session.sql("SELECT " + upd_col + " FROM " + temp_table + " WHERE " + where_clause + " LIMIT 1").to_pandas()
-                                new_val_in_db = verify_df.iloc[0, 0] if not verify_df.empty else None
-
-                                # Normalize values for logging
+                                # Log using old value we fetched from TEMP
                                 to_log_old = normalize_string(old_val) if isinstance(old_val, str) else old_val
-                                to_log_new = new_value
-                                log_change(main_table, "UPDATE", {upd_col: to_log_old}, {upd_col: to_log_new})
+                                log_change(main_table, "UPDATE", {upd_col: to_log_old}, {upd_col: new_value})
+                                st.success("Updated row in TEMP and logged old/new values for approval.")
 
-                                st.success(f"Record updated in TEMP (verified new value: {new_val_in_db}). Old value logged: {to_log_old}")
+                            else:
+                                # Row not in TEMP -> attempt to fetch the old row from MAIN to capture old_value
+                                sel_main_sql = "SELECT * FROM " + main_table + " WHERE " + where_clause + " LIMIT 1"
+                                try:
+                                    main_df_sel = session.sql(sel_main_sql).to_pandas()
+                                except Exception:
+                                    main_df_sel = session.sql("SELECT * FROM " + main_table + " WHERE " + where_clause).to_pandas()
+
+                                if main_df_sel is not None and not main_df_sel.empty:
+                                    # We have a row in MAIN: capture old values, then insert a new TEMP row representing the edit
+                                    main_row = main_df_sel.iloc[0].to_dict()
+                                    main_row_norm = {str(k): (normalize_string(v) if isinstance(v, str) else v) for k, v in main_row.items()}
+                                    old_dict_for_log = clean_for_json(main_row_norm)
+
+                                    # Build new row dict for TEMP: fill keys from key_inputs, upd_col from new_value, others NULL
+                                    new_row = {}
+                                    for c in required_cols:
+                                        if isinstance(key_cols, (list, tuple)) and c in key_inputs:
+                                            new_row[c] = normalize_string(key_inputs[c]) if isinstance(key_inputs[c], str) else key_inputs[c]
+                                        elif not isinstance(key_cols, (list, tuple)) and c == key_cols:
+                                            new_row[c] = normalize_string(key_inputs[key_cols]) if isinstance(key_inputs[key_cols], str) else key_inputs[key_cols]
+                                        elif c == upd_col:
+                                            new_row[c] = normalize_string(new_value) if isinstance(new_value, str) else new_value
+                                        else:
+                                            new_row[c] = None
+
+                                    # Insert new_row into TEMP
+                                    cols_sql = ", ".join(required_cols)
+                                    vals = []
+                                    for c in required_cols:
+                                        v = new_row.get(c)
+                                        if v is None or v == "":
+                                            vals.append("NULL")
+                                        else:
+                                            vals.append("'" + str(v).replace("'", "''") + "'")
+                                    vals_sql = ", ".join(vals)
+                                    session.sql("INSERT INTO " + temp_table + " (" + cols_sql + ") VALUES (" + vals_sql + ")").collect()
+
+                                    # Log as UPDATE (old from MAIN, new from new_row)
+                                    log_change(main_table, "UPDATE", old_dict_for_log, new_row)
+                                    st.success("Row not found in TEMP. Fetched old values from MAIN, inserted edited row into TEMP and logged UPDATE for approval.")
+
+                                else:
+                                    # Not in TEMP nor in MAIN -> treat as INSERT into TEMP and log INSERT
+                                    new_row = {}
+                                    for c in required_cols:
+                                        if isinstance(key_cols, (list, tuple)) and c in key_inputs:
+                                            new_row[c] = normalize_string(key_inputs[c]) if isinstance(key_inputs[c], str) else key_inputs[c]
+                                        elif not isinstance(key_cols, (list, tuple)) and c == key_cols:
+                                            new_row[c] = normalize_string(key_inputs[key_cols]) if isinstance(key_inputs[key_cols], str) else key_inputs[key_cols]
+                                        elif c == upd_col:
+                                            new_row[c] = normalize_string(new_value) if isinstance(new_value, str) else new_value
+                                        else:
+                                            new_row[c] = None
+
+                                    cols_sql = ", ".join(required_cols)
+                                    vals = []
+                                    for c in required_cols:
+                                        v = new_row.get(c)
+                                        if v is None or v == "":
+                                            vals.append("NULL")
+                                        else:
+                                            vals.append("'" + str(v).replace("'", "''") + "'")
+                                    vals_sql = ", ".join(vals)
+                                    session.sql("INSERT INTO " + temp_table + " (" + cols_sql + ") VALUES (" + vals_sql + ")").collect()
+
+                                    # Log as INSERT (old_value = None)
+                                    log_change(main_table, "INSERT", None, new_row)
+                                    st.success("Row not found in MAIN or TEMP. Inserted new row into TEMP and logged INSERT for approval.")
 
                         except Exception as e:
                             st.error("Update failed: " + str(e))
@@ -1198,7 +1262,7 @@ def render_table_ui(tab, table_key):
                 if not confirm:
                     st.warning("Please confirm delete before proceeding.")
                 else:
-                    # Validate keys provided (require full key)
+                    # --- 1) Validate all key inputs ---
                     missing_keys = []
                     if isinstance(key_cols, (list, tuple)):
                         for kc in key_cols:
@@ -1213,39 +1277,101 @@ def render_table_ui(tab, table_key):
                     if missing_keys:
                         st.error("Please provide all key column values before deleting: " + ", ".join(missing_keys))
                     else:
-                        # Build normalized, case-insensitive WHERE clause using helper
+                        # Build normalized, case-insensitive WHERE clause
                         where_clause = build_where_from_key_inputs(key_cols, del_key_inputs)
+
                         if not where_clause:
-                            st.error("Could not build WHERE clause for delete; please check key values and try again.")
+                            st.error("Could not build WHERE clause. Please check key values.")
                         else:
                             try:
-                                # Fetch the existing row first (we need to log it)
-                                sel_sql = "SELECT * FROM " + temp_table + " WHERE " + where_clause + " LIMIT 1"
+                                # ----------------------------------------------------
+                                # --- 2) Try DELETE from TEMP first (Option B step 1)
+                                # ----------------------------------------------------
+                                sel_temp_sql = "SELECT * FROM " + temp_table + " WHERE " + where_clause + " LIMIT 1"
                                 try:
-                                    old_df = session.sql(sel_sql).to_pandas()
+                                    temp_df = session.sql(sel_temp_sql).to_pandas()
                                 except Exception:
-                                    # Some Snowflake setups don't accept LIMIT in this form; fallback
-                                    old_df = session.sql("SELECT * FROM " + temp_table + " WHERE " + where_clause).to_pandas()
+                                    # Fallback for Snowflake if LIMIT issues
+                                    temp_df = session.sql("SELECT * FROM " + temp_table + " WHERE " + where_clause).to_pandas()
 
-                                if old_df is None or old_df.empty:
-                                    st.error("No matching row found in TEMP for the provided key values. Delete aborted.")
-                                else:
-                                    # Convert the fetched row to a JSON-safe dict for logging
-                                    # Use the first matched row
-                                    row_dict = old_df.iloc[0].to_dict()
-                                    # Normalize string values
-                                    row_dict_norm = {str(k): (normalize_string(v) if isinstance(v, str) else v) for k, v in row_dict.items()}
-                                    row_dict_clean = clean_for_json(row_dict_norm)
+                                if temp_df is not None and not temp_df.empty:
+                                    # Row exists in TEMP → capture old row
+                                    old_row_dict = temp_df.iloc[0].to_dict()
+                                    old_row_norm = {
+                                        str(k): (normalize_string(v) if isinstance(v, str) else v)
+                                        for k, v in old_row_dict.items()
+                                    }
+                                    old_row_clean = clean_for_json(old_row_norm)
 
-                                    # Perform the delete
+                                    # Delete from TEMP
                                     session.sql("DELETE FROM " + temp_table + " WHERE " + where_clause).collect()
 
-                                    # Log the delete with old_value populated
-                                    log_change(main_table, "DELETE", row_dict_clean, None)
-                                    st.success("Record deleted from TEMP and logged.")
+                                    # Log DELETE
+                                    log_change(main_table, "DELETE", old_row_clean, None)
+                                    st.success("Deleted row from TEMP and logged DELETE for approval.")
+
+                                else:
+                                    # ----------------------------------------------------
+                                    # --- 3) Row not in TEMP → fetch from MAIN (Option B)
+                                    # ----------------------------------------------------
+                                    sel_main_sql = "SELECT * FROM " + main_table + " WHERE " + where_clause + " LIMIT 1"
+                                    try:
+                                        main_df_sel = session.sql(sel_main_sql).to_pandas()
+                                    except Exception:
+                                        main_df_sel = session.sql("SELECT * FROM " + main_table + " WHERE " 
+                                        + where_clause).to_pandas()
+
+                                    if main_df_sel is not None and not main_df_sel.empty:
+                                        # --- Found in MAIN → copy to TEMP + log DELETE ---
+                                        main_row = main_df_sel.iloc[0].to_dict()
+                                        main_row_norm = {
+                                            str(k): (normalize_string(v) if isinstance(v, str) else v)
+                                            for k, v in main_row.items()
+                                        }
+                                        old_row_clean = clean_for_json(main_row_norm)
+
+                                        # Build TEMP row values from MAIN row (full copy)
+                                        new_temp_row = {}
+                                        for c in required_cols:
+                                            v = main_row.get(c)
+                                            if isinstance(v, str):
+                                                new_temp_row[c] = normalize_string(v)
+                                            else:
+                                                new_temp_row[c] = v
+
+                                        # Insert the copied MAIN row into TEMP
+                                        cols_sql = ", ".join(required_cols)
+                                        vals_sql_parts = []
+                                        for c in required_cols:
+                                            v = new_temp_row.get(c)
+                                            if v is None or v == "":
+                                                vals_sql_parts.append("NULL")
+                                            else:
+                                                vals_sql_parts.append("'" + str(v).replace("'", "''") + "'")
+                                        vals_sql = ", ".join(vals_sql_parts)
+
+                                        session.sql(
+                                            "INSERT INTO " + temp_table + " (" + cols_sql + ") VALUES (" + vals_sql + ")"
+                                        ).collect()
+
+                                        # Log DELETE
+                                        log_change(main_table, "DELETE", old_row_clean, None)
+
+                                        st.success(
+                                            "Row not found in TEMP. Fetched from MAIN, inserted into TEMP, and logged DELETE for approval."
+                                        )
+
+                                    else:
+                                        # ----------------------------------------------------
+                                        # --- 4) Not in MAIN or TEMP → can't delete
+                                        # ----------------------------------------------------
+                                        st.error(
+                                            "No matching record found in MAIN or TEMP for the provided key values. "
+                                            "Delete request aborted."
+                                        )
+
                             except Exception as e:
                                 st.error("Delete failed: " + str(e))
-
 
 # Render tabs
 tab1, tab2 = st.tabs(["DDM_DOMAIN_VALUE", "DDM_XREF_DOMAIN_VALUE"])
