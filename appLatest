@@ -620,6 +620,12 @@ def render_table_ui(tab, table_key):
                                 elif act == "UPDATE":
                                     set_clause = None
                                     where_clause = None
+                                    if not isinstance(parsed_old, dict) or not parsed_old:
+                                        # Try quick DB lookup by matching parsed_new's key columns if possible
+                                        # but prefer to warn: the log had no usable old_value
+                                        st.warning(f"Warning: parsed_old empty for log_id={log_id}. Cannot build WHERE from old_value.")
+                                        # for debugging: show content of original DB log fields
+                                        st.info(f"Log row: log_id={log_id}, new_value={new_value_db}, old_value={old_value_db}")
                                     if isinstance(parsed_new, dict):
                                         set_parts = []
                                         for kcol, vcol in parsed_new.items():
@@ -633,6 +639,17 @@ def render_table_ui(tab, table_key):
                                             else:
                                                 where_parts.append(f"{kcol.upper()} = {coerce_value_for_column(kcol, vcol, main_col_types)}")
                                         where_clause = " AND ".join(where_parts) if where_parts else None
+                                    if not where_clause and isinstance(parsed_new, dict):
+                                        try_where_parts = []
+                                        for kcol in main_info.get("key_col", [] if not isinstance(main_info.get("key_col"), list) else main_info.get("key_col")):
+                                            vcol = parsed_new.get(kcol) or parsed_new.get(kcol.lower()) or parsed_new.get(kcol.upper())
+                                            if vcol is None:
+                                                try_where_parts.append(f"{kcol.upper()} IS NULL")
+                                            else:
+                                                try_where_parts.append(f"{kcol.upper()} = {coerce_value_for_column(kcol, vcol, main_col_types)}")
+                                        try_where = " AND ".join(try_where_parts) if try_where_parts else None
+                                        if try_where:
+                                            where_clause = try_where
 
                                     if set_clause and where_clause:
                                         update_sql = "UPDATE " + main_table_name + " SET " + set_clause + " WHERE " + where_clause
@@ -1125,23 +1142,40 @@ def render_table_ui(tab, table_key):
                         st.error("Could not build WHERE clause for update; provide key values.")
                     else:
                         try:
+                            # Normalize new value for SQL
                             escaped_new_value = "" if new_value is None else str(normalize_string(new_value)).replace("'", "''")
-                            # capture old before update (case-insensitive search via WHERE builder)
+                            # 1) Fetch the existing row BEFORE updating (to capture old_value)
+                            sel_sql = "SELECT * FROM " + temp_table + " WHERE " + where_clause + " LIMIT 1"
                             try:
-                                old_df = session.sql("SELECT " + upd_col + " FROM " + temp_table + " WHERE " + where_clause).to_pandas()
-                                old_val = old_df.iloc[0, 0] if not old_df.empty else None
+                                old_df = session.sql(sel_sql).to_pandas()
                             except Exception:
-                                old_val = None
+                                old_df = session.sql("SELECT * FROM " + temp_table + " WHERE " + where_clause).to_pandas()
 
-                            # perform update
-                            result = session.sql("UPDATE " + temp_table + " SET " + upd_col + " = '" + escaped_new_value + "' WHERE " + where_clause).collect()
-                            # Log old value (normalize string if present)
-                            if isinstance(old_val, str):
-                                old_val_to_log = normalize_string(old_val)
+                            if old_df is None or old_df.empty:
+                                st.error("No matching row found in TEMP for the provided key values. Update aborted.")
                             else:
-                                old_val_to_log = old_val
-                            log_change(main_table, "UPDATE", {upd_col: old_val_to_log}, {upd_col: new_value})
-                            st.success("Record updated in TEMP and logged.")
+                                # Get the old value for the column being updated
+                                old_val = None
+                                try:
+                                    old_val = old_df.iloc[0].get(upd_col)
+                                except Exception:
+                                    old_val = old_df.iloc[0].to_dict().get(upd_col)
+
+                                # Perform the update
+                                update_sql = "UPDATE " + temp_table + " SET " + upd_col + " = '" + escaped_new_value + "' WHERE " + where_clause
+                                session.sql(update_sql).collect()
+
+                                # Verify update applied in TEMP (simple SELECT)
+                                verify_df = session.sql("SELECT " + upd_col + " FROM " + temp_table + " WHERE " + where_clause + " LIMIT 1").to_pandas()
+                                new_val_in_db = verify_df.iloc[0, 0] if not verify_df.empty else None
+
+                                # Normalize values for logging
+                                to_log_old = normalize_string(old_val) if isinstance(old_val, str) else old_val
+                                to_log_new = new_value
+                                log_change(main_table, "UPDATE", {upd_col: to_log_old}, {upd_col: to_log_new})
+
+                                st.success(f"Record updated in TEMP (verified new value: {new_val_in_db}). Old value logged: {to_log_old}")
+
                         except Exception as e:
                             st.error("Update failed: " + str(e))
 
@@ -1164,36 +1198,53 @@ def render_table_ui(tab, table_key):
                 if not confirm:
                     st.warning("Please confirm delete before proceeding.")
                 else:
-                    # Validate keys provided
+                    # Validate keys provided (require full key)
                     missing_keys = []
                     if isinstance(key_cols, (list, tuple)):
                         for kc in key_cols:
-                            if not del_key_inputs.get(kc) or str(del_key_inputs.get(kc)).strip() == "":
+                            v = del_key_inputs.get(kc)
+                            if v is None or (isinstance(v, str) and v.strip() == ""):
                                 missing_keys.append(kc)
                     else:
-                        if not del_key_inputs.get(key_cols) or str(del_key_inputs.get(key_cols)).strip() == "":
+                        v = del_key_inputs.get(key_cols)
+                        if v is None or (isinstance(v, str) and v.strip() == ""):
                             missing_keys.append(key_cols)
 
                     if missing_keys:
-                        st.error("Please provide all key column values: " + ", ".join(missing_keys))
+                        st.error("Please provide all key column values before deleting: " + ", ".join(missing_keys))
                     else:
+                        # Build normalized, case-insensitive WHERE clause using helper
                         where_clause = build_where_from_key_inputs(key_cols, del_key_inputs)
                         if not where_clause:
-                            st.error("Could not build WHERE clause for delete; provide key values.")
+                            st.error("Could not build WHERE clause for delete; please check key values and try again.")
                         else:
                             try:
-                                old_val = None
+                                # Fetch the existing row first (we need to log it)
+                                sel_sql = "SELECT * FROM " + temp_table + " WHERE " + where_clause + " LIMIT 1"
                                 try:
-                                    old_df = session.sql("SELECT * FROM " + temp_table + " WHERE " + where_clause).to_pandas()
-                                    old_val = old_df.to_dict(orient="records")[0] if not old_df.empty else None
+                                    old_df = session.sql(sel_sql).to_pandas()
                                 except Exception:
-                                    old_val = None
-                                session.sql("DELETE FROM " + temp_table + " WHERE " + where_clause).collect()
-                                log_change(main_table, "DELETE", old_val, None)
-                                st.success("Record deleted from TEMP and logged.")
+                                    # Some Snowflake setups don't accept LIMIT in this form; fallback
+                                    old_df = session.sql("SELECT * FROM " + temp_table + " WHERE " + where_clause).to_pandas()
+
+                                if old_df is None or old_df.empty:
+                                    st.error("No matching row found in TEMP for the provided key values. Delete aborted.")
+                                else:
+                                    # Convert the fetched row to a JSON-safe dict for logging
+                                    # Use the first matched row
+                                    row_dict = old_df.iloc[0].to_dict()
+                                    # Normalize string values
+                                    row_dict_norm = {str(k): (normalize_string(v) if isinstance(v, str) else v) for k, v in row_dict.items()}
+                                    row_dict_clean = clean_for_json(row_dict_norm)
+
+                                    # Perform the delete
+                                    session.sql("DELETE FROM " + temp_table + " WHERE " + where_clause).collect()
+
+                                    # Log the delete with old_value populated
+                                    log_change(main_table, "DELETE", row_dict_clean, None)
+                                    st.success("Record deleted from TEMP and logged.")
                             except Exception as e:
                                 st.error("Delete failed: " + str(e))
-
 
 
 # Render tabs
