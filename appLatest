@@ -840,14 +840,30 @@ def render_table_ui(tab, table_key):
                     # build index maps keyed by stable key
                     orig_index = {}
                     new_index = {}
+                    orig_keys = []
+
                     if not orig_norm.empty:
+                        # Build orig_index and list of orig_keys (ordered by row position)
                         for _, r in orig_norm.iterrows():
                             k = get_row_key(r, key_cols)
                             orig_index[k] = r
+                            orig_keys.append(k)
+
                     if not new_norm.empty:
-                        for _, r in new_norm.iterrows():
-                            k = get_row_key(r, key_cols)
-                            new_index[k] = r
+                        # Build new_index but retain mapping to the original key by row position.
+                        # This helps when key columns were edited (so new key != old key).
+                        # We'll use row position to find the corresponding original key if available.
+                        new_rows = list(new_norm.iterrows())
+                        for idx, (_i, r) in enumerate(new_rows):
+                            # prefer the original key at same row index (if present)
+                            if idx < len(orig_keys):
+                                orig_key_for_this_row = orig_keys[idx]
+                            else:
+                                # fallback: compute key from the new row
+                                orig_key_for_this_row = get_row_key(r, key_cols)
+                            # store mapping using a special composite key: orig_key_for_this_row
+                            new_index[orig_key_for_this_row] = r
+
 
                     processed = 0
                     errors = []
@@ -866,9 +882,10 @@ def render_table_ui(tab, table_key):
                         session.sql("INSERT INTO " + temp_table + " (" + cols_sql + ") VALUES (" + vals_sql + ")").collect()
 
                     # iterate over new rows and compare to orig, send changed rows
-                    for k, new_row in new_index.items():
+                    for orig_key, new_row in new_index.items():
                         try:
-                            old_row = orig_index.get(k)
+                            # old_row is retrieved by the original key we stored earlier (position-based)
+                            old_row = orig_index.get(orig_key)
                             if old_row is None:
                                 changed = True
                             else:
@@ -890,44 +907,9 @@ def render_table_ui(tab, table_key):
                             if not changed:
                                 continue
 
-                            # DB-first authoritative old_dict fetch (query MAIN table first, fallback to in-memory)
-                            old_dict = {c: None for c in required_cols}
-                            try:
-                                # build key_inputs: prefer values from old_row if present, otherwise use new_row values
-                                key_inputs = {}
-                                if isinstance(key_cols, (list, tuple)):
-                                    for kc in key_cols:
-                                        key_inputs[kc] = get_series_value(old_row, kc) if old_row is not None else get_series_value(new_row, kc)
-                                else:
-                                    key_inputs[key_cols] = get_series_value(old_row, key_cols) if old_row is not None else get_series_value(new_row, key_cols)
-
-                                where_clause = build_where_from_key_inputs(key_cols, key_inputs)
-                                if where_clause:
-                                    sel_sql = f"SELECT {', '.join(required_cols)} FROM {main_table} WHERE {where_clause} LIMIT 1"
-                                    try:
-                                        fetched_df = session.sql(sel_sql).to_pandas()
-                                        if not fetched_df.empty:
-                                            fetched_row = fetched_df.iloc[0].to_dict()
-                                            old_dict = {
-                                                c: normalize_string(fetched_row.get(c)) if isinstance(fetched_row.get(c), str)
-                                                else clean_for_json(fetched_row.get(c))
-                                                for c in required_cols
-                                            }
-                                    except Exception:
-                                        # DB fetch failed; will fall back below
-                                        pass
-
-                                # Fallback to in-memory old_row only if DB returned no row (or values were all None)
-                                if all(old_dict[c] is None for c in required_cols) and old_row is not None:
-                                    old_dict = {c: get_series_value(old_row, c) for c in required_cols}
-
-                            except Exception:
-                                # Worst-case fallback: use in-memory old_row when available, else Nones
-                                if old_row is not None:
-                                    old_dict = {c: get_series_value(old_row, c) for c in required_cols}
-                                else:
-                                    old_dict = {c: None for c in required_cols}
-
+                            # DB-first authoritative old_dict fetch
+                            old_dict = {c: get_series_value(old_row, c) for c in required_cols} if old_row is not None else {c: None for c in required_cols}
+                            # Fallback: in-memory old_row only if DB returns no row
                             # ---------------------------
                             # Build new_dict from the edited row (always available)
                             new_dict = {c: get_series_value(new_row, c) for c in required_cols}
