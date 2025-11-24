@@ -49,7 +49,6 @@ def ensure_session():
             st.stop()
             return False
 
-
 # Best-effort add openpyxl
 try:
     if session is not None:
@@ -188,7 +187,7 @@ def log_change(main_table_name, action, old_value=None, new_value=None):
     cleaned_old = clean_for_json(old_value) if old_value is not None else None
     cleaned_new = clean_for_json(new_value) if new_value is not None else None
     old_json = json.dumps(cleaned_old) if cleaned_old is not None else None
-    new_json = json.dumps(cleaned_new) if new_json is not None else None
+    new_json = json.dumps(cleaned_new) if cleaned_new is not None else None
     old_sql_val = "$$ " + old_json + " $$" if old_json is not None else "NULL"
     new_sql_val = "$$ " + new_json + " $$" if new_json is not None else "NULL"
     insert_sql = (
@@ -321,11 +320,13 @@ def get_row_key(row, key_cols):
         parts = []
         for k in key_cols:
             v = None
+            # try case-sensitive access first
             try:
                 v = row.get(k)
             except Exception:
                 v = None
             if v is None and hasattr(row, "index"):
+                # fallback case-insensitive
                 for colname in row.index:
                     try:
                         if str(colname).lower() == str(k).lower():
@@ -666,7 +667,7 @@ def render_table_ui(tab, table_key):
                                         except Exception as e:
                                             errors.append(f"Could not clear TEMP for log_id={log_id}: {e}")
                                     else:
-                                        # fallback: try parsed_new as where
+                                        # fallback: try parsed_new as way to locate row for delete
                                         if isinstance(parsed_new, dict):
                                             where_parts = []
                                             for kcol, vcol in parsed_new.items():
@@ -889,40 +890,42 @@ def render_table_ui(tab, table_key):
                             if not changed:
                                 continue
 
-                            # ---------------------------
-                            # NEW: Build authoritative old_dict by querying MAIN table first
-                            # then fallback to in-memory old_row if DB fetch fails or returns no row
-                            # ---------------------------
-                            old_dict = {c: None for c in required_cols}
+                            # DB-first authoritative old_dict fetch (try to get the current row from main table using key values)
+                            old_dict = None
                             try:
-                                key_inputs = {}
+                                # Build a key -> value map to locate the DB row (prefer values from old_row; fall back to new_row)
+                                key_lookup = {}
                                 if isinstance(key_cols, (list, tuple)):
                                     for kc in key_cols:
-                                        key_inputs[kc] = get_series_value(old_row, kc) if old_row is not None else get_series_value(new_row, kc)
+                                        key_lookup[kc] = get_series_value(old_row, kc) if old_row is not None else get_series_value(new_row, kc)
                                 else:
-                                    key_inputs[key_cols] = get_series_value(old_row, key_cols) if old_row is not None else get_series_value(new_row, key_cols)
+                                    key_lookup[key_cols] = get_series_value(old_row, key_cols) if old_row is not None else get_series_value(new_row, key_cols)
 
-                                where_clause = build_where_from_key_inputs(key_cols, key_inputs)
-
-                                if where_clause:
-                                    sel_sql = f"SELECT {', '.join(required_cols)} FROM {main_table} WHERE {where_clause} LIMIT 1"
+                                where_for_db = build_where_from_dict(key_lookup)
+                                if where_for_db:
                                     try:
-                                        fetched_df = session.sql(sel_sql).to_pandas()
-                                        if not fetched_df.empty:
-                                            fetched_row = fetched_df.iloc[0].to_dict()
-                                            old_dict = {
-                                                c: normalize_string(fetched_row.get(c)) if isinstance(fetched_row.get(c), str)
-                                                else clean_for_json(fetched_row.get(c))
-                                                for c in required_cols
-                                            }
+                                        sel_df = session.sql("SELECT * FROM " + main_table + " WHERE " + where_for_db + " LIMIT 1").to_pandas()
+                                        if not sel_df.empty:
+                                            rowrec = sel_df.iloc[0].to_dict()
+                                            # Normalize into required_cols order/keys
+                                            old_dict = {}
+                                            for c in required_cols:
+                                                # robust lookup (try exact, lower, upper)
+                                                if c in rowrec:
+                                                    old_dict[c] = rowrec.get(c)
+                                                elif c.lower() in rowrec:
+                                                    old_dict[c] = rowrec.get(c.lower())
+                                                elif c.upper() in rowrec:
+                                                    old_dict[c] = rowrec.get(c.upper())
+                                                else:
+                                                    old_dict[c] = None
                                     except Exception:
-                                        # DB fetch failed — we'll fallback later
-                                        pass
-
-                                # Fallback to in-memory old_row if DB gave nothing
-                                if all(old_dict[c] is None for c in required_cols) and old_row is not None:
-                                    old_dict = {c: get_series_value(old_row, c) for c in required_cols}
+                                        old_dict = None
                             except Exception:
+                                old_dict = None
+
+                            # Fallback: if DB didn't return a row, use the in-memory orig row (if present), otherwise Nones
+                            if old_dict is None:
                                 if old_row is not None:
                                     old_dict = {c: get_series_value(old_row, c) for c in required_cols}
                                 else:
@@ -930,8 +933,6 @@ def render_table_ui(tab, table_key):
 
                             # Build new_dict from the edited row (always available)
                             new_dict = {c: get_series_value(new_row, c) for c in required_cols}
-
-                            # Build cleaned_new_json for duplicate guard check
                             cleaned_new_json = json.dumps(clean_for_json(new_dict))
 
                             # Check duplicate pending log guard
@@ -1108,16 +1109,39 @@ def render_table_ui(tab, table_key):
                     st.error("Could not build WHERE clause for update; provide key values.")
                 else:
                     try:
-                        escaped_new_value = "" if new_value is None else str(normalize_string(new_value)).replace("'", "''")
-                        # capture old before update
+                        # Fetch full existing row from TEMP (DB-first) to capture old state
+                        old_row = None
                         try:
-                            old_df = session.sql("SELECT " + upd_col + " FROM " + temp_table + " WHERE " + where_clause).to_pandas()
-                            old_val = old_df.iloc[0, 0] if not old_df.empty else None
+                            old_df = session.sql("SELECT * FROM " + temp_table + " WHERE " + where_clause + " LIMIT 1").to_pandas()
+                            if not old_df.empty:
+                                old_row = old_df.to_dict(orient="records")[0]
                         except Exception:
-                            old_val = None
-                        session.sql("UPDATE " + temp_table + " SET " + upd_col + " = '" + escaped_new_value + "' WHERE " + where_clause).collect()
-                        log_change(main_table, "UPDATE", {upd_col: old_val}, {upd_col: new_value})
-                        st.success("Record updated in TEMP and logged.")
+                            old_row = None
+
+                        if old_row is None:
+                            st.warning("No matching row found in TEMP to update; nothing logged.")
+                        else:
+                            # Build new_row from old_row but with the updated column set to new_value
+                            new_row = dict(old_row)  # shallow copy
+                            # Normalize new_value
+                            nv = new_value
+                            if isinstance(nv, str):
+                                nv = normalize_string(nv)
+                            try:
+                                if pd.isna(nv):
+                                    nv = None
+                            except Exception:
+                                pass
+                            new_row[upd_col] = nv
+
+                            # Perform the update on TEMP (use safe escaping for string)
+                            escaped_new_value = "" if new_value is None else str(normalize_string(new_value)).replace("'", "''")
+                            session.sql("UPDATE " + temp_table + " SET " + upd_col + " = '" + escaped_new_value + "' WHERE " + where_clause).collect()
+
+                            # Ensure we log full row old->new for approval
+                            # Convert any pandas Timestamps etc. to JSON-safe types via clean_for_json inside log_change
+                            log_change(main_table, "UPDATE", old_row, new_row)
+                            st.success("Record updated in TEMP and logged for approval.")
                     except Exception as e:
                         st.error("Update failed: " + str(e))
 
@@ -1144,18 +1168,24 @@ def render_table_ui(tab, table_key):
                         st.error("Could not build WHERE clause for delete; provide key values.")
                     else:
                         try:
+                            # Fetch full row from TEMP to capture old_value for logging
                             old_val = None
                             try:
-                                old_df = session.sql("SELECT * FROM " + temp_table + " WHERE " + where_clause).to_pandas()
-                                old_val = old_df.to_dict(orient="records")[0] if not old_df.empty else None
+                                old_df = session.sql("SELECT * FROM " + temp_table + " WHERE " + where_clause + " LIMIT 1").to_pandas()
+                                if not old_df.empty:
+                                    old_val = old_df.to_dict(orient="records")[0]
                             except Exception:
                                 old_val = None
+
+                            # Instead of immediately deleting from MAIN, we delete from TEMP and log the DELETE action.
+                            # The approval step will delete from MAIN when log is approved.
                             session.sql("DELETE FROM " + temp_table + " WHERE " + where_clause).collect()
+
+                            # Log the delete with full old row (if available) so approval can delete from main table.
                             log_change(main_table, "DELETE", old_val, None)
-                            st.success("Record deleted from TEMP and logged.")
+                            st.success("Record deleted from TEMP and logged for approval.")
                         except Exception as e:
                             st.error("Delete failed: " + str(e))
-
 
 # Render tabs
 tab1, tab2 = st.tabs(["DDM_DOMAIN_VALUE", "DDM_XREF_DOMAIN_VALUE"])
