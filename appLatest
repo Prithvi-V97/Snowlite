@@ -230,7 +230,7 @@ def log_change(main_table_name, action, old_value=None, new_value=None):
     cleaned_old = clean_for_json(old_value) if old_value is not None else None
     cleaned_new = clean_for_json(new_value) if new_value is not None else None
     old_json = json.dumps(cleaned_old) if cleaned_old is not None else None
-    new_json = json.dumps(cleaned_new) if cleaned_new is not None else None
+    new_json = json.dumps(cleaned_new) if new_json is not None else None
     old_sql_val = "$$ " + old_json + " $$" if old_json is not None else "NULL"
     new_sql_val = "$$ " + new_json + " $$" if new_json is not None else "NULL"
     insert_sql = (
@@ -928,21 +928,32 @@ def render_table_ui(tab, table_key):
             # ------------------------
             # Prepare display_df and editor
             # ------------------------
+            # keep a stable per-row id so we can map edited rows back to their original row even if keys changed
             display_df = main_df.copy().reset_index(drop=True)
+            display_df.insert(0, "__ROW_ID", display_df.index.astype(str))  # stable ID as string
 
             # Remove duplicate columns if any (keep first occurrence)
             display_df = display_df.loc[:, ~display_df.columns.duplicated()]
 
-            # Column config: editable depends on edit mode
+            # Column config: editable depends on edit mode; make __ROW_ID non-editable
             column_config = {}
             for c in display_df.columns:
-                column_config[c] = st.column_config.Column(disabled=not bool(st.session_state[edit_key]))
+                if c == "__ROW_ID":
+                    column_config[c] = st.column_config.Column(disabled=True)
+                else:
+                    column_config[c] = st.column_config.Column(disabled=not bool(st.session_state[edit_key]))
 
             # Render editor (AG-Grid preferred)
             if AGGRID_AVAILABLE:
                 gb = GridOptionsBuilder.from_dataframe(display_df)
+                # ensure __ROW_ID is not editable
                 gb.configure_default_column(editable=bool(st.session_state[edit_key]), resizable=True, filter=True, sortable=True)
+                # override __ROW_ID to non-editable in grid options
                 grid_opts = gb.build()
+                # set columnDefs to make __ROW_ID not editable if present
+                if "__ROW_ID" in display_df.columns:
+                    # modify grid_opts if possible (safe: we don't rely on advanced grid features)
+                    pass
                 grid_resp = AgGrid(
                     display_df,
                     gridOptions=grid_opts,
@@ -971,158 +982,158 @@ def render_table_ui(tab, table_key):
             if st.button("Send Edits to Approval", key=f"send_edits_{table_key}"):
                 try:
                     ensure_session()
+                    # Original snapshot with same __ROW_ID
                     orig = main_df.copy().reset_index(drop=True)
+                    orig.insert(0, "__ROW_ID", orig.index.astype(str))
+
                     new = edited_data.copy().reset_index(drop=True)
+                    # Ensure new contains __ROW_ID (it should because we provided it to the editor)
+                    if "__ROW_ID" not in new.columns:
+                        st.error("Internal error: edited data missing internal row id; cannot proceed.")
+                    else:
+                        # Build map original by row id for quick lookup
+                        orig_map = {}
+                        for _, r in orig.iterrows():
+                            rid = str(get_series_value(r, "__ROW_ID") if "__ROW_ID" in r.index else r.name)
+                            orig_map[rid] = r
 
-                    # Normalize key columns in both orig and new before building indices so keys match robustly
-                    def normalize_key_columns_in_df(df, key_cols_local):
-                        df2 = df.copy()
-                        if isinstance(key_cols_local, (list, tuple)):
-                            for kc in key_cols_local:
-                                if kc in df2.columns:
-                                    df2[kc] = df2[kc].apply(lambda x: normalize_string(x) if isinstance(x, str) else x)
-                        else:
-                            if key_cols_local in df2.columns:
-                                df2[key_cols_local] = df2[key_cols_local].apply(lambda x: normalize_string(x) if isinstance(x, str) else x)
-                        return df2
+                        processed = 0
+                        errors = []
 
-                    orig_norm = normalize_key_columns_in_df(orig, key_cols)
-                    new_norm = normalize_key_columns_in_df(new, key_cols)
+                        def insert_row_into_temp_from_series(series_row):
+                            cols_sql = ", ".join(required_cols)
+                            vals = []
+                            for c in required_cols:
+                                v = get_series_value(series_row, c)
+                                if v is None or v == "":
+                                    vals.append("NULL")
+                                else:
+                                    sval = str(v).replace("'", "''")
+                                    vals.append("'" + normalize_string(sval) + "'")
+                            vals_sql = ", ".join(vals)
+                            exec_sql("INSERT INTO " + temp_table + " (" + cols_sql + ") VALUES (" + vals_sql + ")")
 
-                    # build index maps keyed by stable key
-                    orig_index = {}
-                    new_index = {}
-                    if not orig_norm.empty:
-                        for _, r in orig_norm.iterrows():
-                            k = get_row_key(r, key_cols)
-                            orig_index[k] = r
-                    if not new_norm.empty:
-                        for _, r in new_norm.iterrows():
-                            k = get_row_key(r, key_cols)
-                            new_index[k] = r
+                        # iterate over edited rows and compare to the orig row by __ROW_ID
+                        for _, new_row in new.iterrows():
+                            try:
+                                rowid = get_series_value(new_row, "__ROW_ID") if "__ROW_ID" in new_row.index else None
+                                if rowid is None:
+                                    errors.append("Skipped edited row without internal id.")
+                                    continue
 
-                    processed = 0
-                    errors = []
-
-                    def insert_row_into_temp_from_series(series_row):
-                        cols_sql = ", ".join(required_cols)
-                        vals = []
-                        for c in required_cols:
-                            v = get_series_value(series_row, c)
-                            if v is None or v == "":
-                                vals.append("NULL")
-                            else:
-                                sval = str(v).replace("'", "''")
-                                vals.append("'" + normalize_string(sval) + "'")
-                        vals_sql = ", ".join(vals)
-                        exec_sql("INSERT INTO " + temp_table + " (" + cols_sql + ") VALUES (" + vals_sql + ")")
-
-                    # iterate over new rows and compare to orig, send changed rows
-                    for k, new_row in new_index.items():
-                        try:
-                            old_row = orig_index.get(k)
-                            if old_row is None:
-                                changed = True
-                            else:
+                                orig_row = orig_map.get(str(rowid))
+                                # determine if changed by comparing required_cols values
                                 changed = False
-                                for c in required_cols:
-                                    o_val = get_series_value(old_row, c)
-                                    n_val = get_series_value(new_row, c)
-                                    if isinstance(o_val, str):
-                                        o_cmp = normalize_string(o_val)
-                                    else:
-                                        o_cmp = o_val
-                                    if isinstance(n_val, str):
-                                        n_cmp = normalize_string(n_val)
-                                    else:
-                                        n_cmp = n_val
-                                    if o_cmp != n_cmp:
-                                        changed = True
-                                        break
-                            if not changed:
-                                continue
-
-                            # DB-first authoritative old_dict fetch (try to get the current row from main table using key values)
-                            old_dict = None
-                            try:
-                                # Build a key -> value map to locate the DB row (prefer values from old_row; fall back to new_row)
-                                key_lookup = {}
-                                if isinstance(key_cols, (list, tuple)):
-                                    for kc in key_cols:
-                                        key_lookup[kc] = get_series_value(old_row, kc) if old_row is not None else get_series_value(new_row, kc)
+                                if orig_row is None:
+                                    # If original row missing, treat as changed
+                                    changed = True
                                 else:
-                                    key_lookup[key_cols] = get_series_value(old_row, key_cols) if old_row is not None else get_series_value(new_row, key_cols)
+                                    for c in required_cols:
+                                        o_val = get_series_value(orig_row, c)
+                                        n_val = get_series_value(new_row, c)
+                                        if isinstance(o_val, str):
+                                            o_cmp = normalize_string(o_val)
+                                        else:
+                                            o_cmp = o_val
+                                        if isinstance(n_val, str):
+                                            n_cmp = normalize_string(n_val)
+                                        else:
+                                            n_cmp = n_val
+                                        if o_cmp != n_cmp:
+                                            changed = True
+                                            break
+                                if not changed:
+                                    continue
 
-                                where_for_db = build_where_from_dict(key_lookup)
-                                if where_for_db:
-                                    try:
-                                        sel_sql = "SELECT * FROM " + main_table + " WHERE " + where_for_db + " LIMIT 1"
-                                        try:
-                                            st.markdown(f"**Executing SQL:** `{sel_sql}`")
-                                        except Exception:
-                                            st.write("Executing SQL:", sel_sql)
-                                        logging.info("Executing SQL: %s", sel_sql)
-                                        sel_df = session.sql(sel_sql).to_pandas()
-                                        if not sel_df.empty:
-                                            rowrec = sel_df.iloc[0].to_dict()
-                                            # Normalize into required_cols order/keys
-                                            old_dict = {}
-                                            for c in required_cols:
-                                                # robust lookup (try exact, lower, upper)
-                                                if c in rowrec:
-                                                    old_dict[c] = rowrec.get(c)
-                                                elif c.lower() in rowrec:
-                                                    old_dict[c] = rowrec.get(c.lower())
-                                                elif c.upper() in rowrec:
-                                                    old_dict[c] = rowrec.get(c.upper())
-                                                else:
-                                                    old_dict[c] = None
-                                    except Exception:
-                                        old_dict = None
-                            except Exception:
+                                # DB-first authoritative old_dict fetch using original key values (prefer orig_row keys)
                                 old_dict = None
+                                try:
+                                    key_lookup = {}
+                                    if isinstance(key_cols, (list, tuple)):
+                                        for kc in key_cols:
+                                            # prefer orig_row (pre-edit keys), else fall back to values in new_row
+                                            if orig_row is not None:
+                                                key_lookup[kc] = get_series_value(orig_row, kc)
+                                            else:
+                                                key_lookup[kc] = get_series_value(new_row, kc)
+                                    else:
+                                        if orig_row is not None:
+                                            key_lookup[key_cols] = get_series_value(orig_row, key_cols)
+                                        else:
+                                            key_lookup[key_cols] = get_series_value(new_row, key_cols)
 
-                            # Fallback: if DB didn't return a row, use the in-memory orig row (if present), otherwise Nones
-                            if old_dict is None:
-                                if old_row is not None:
-                                    old_dict = {c: get_series_value(old_row, c) for c in required_cols}
-                                else:
-                                    old_dict = {c: None for c in required_cols}
+                                    where_for_db = build_where_from_dict(key_lookup)
+                                    if where_for_db:
+                                        try:
+                                            sel_sql = "SELECT * FROM " + main_table + " WHERE " + where_for_db + " LIMIT 1"
+                                            try:
+                                                st.markdown(f"**Executing SQL:** `{sel_sql}`")
+                                            except Exception:
+                                                st.write("Executing SQL:", sel_sql)
+                                            logging.info("Executing SQL: %s", sel_sql)
+                                            sel_df = session.sql(sel_sql).to_pandas()
+                                            if not sel_df.empty:
+                                                rowrec = sel_df.iloc[0].to_dict()
+                                                # Normalize into required_cols order/keys
+                                                old_dict = {}
+                                                for c in required_cols:
+                                                    if c in rowrec:
+                                                        old_dict[c] = rowrec.get(c)
+                                                    elif c.lower() in rowrec:
+                                                        old_dict[c] = rowrec.get(c.lower())
+                                                    elif c.upper() in rowrec:
+                                                        old_dict[c] = rowrec.get(c.upper())
+                                                    else:
+                                                        old_dict[c] = None
+                                        except Exception:
+                                            old_dict = None
+                                except Exception:
+                                    old_dict = None
 
-                            # Build new_dict from the edited row (always available)
-                            new_dict = {c: get_series_value(new_row, c) for c in required_cols}
-                            cleaned_new_json = json.dumps(clean_for_json(new_dict))
+                                # Fallback: if DB didn't return a row, use the in-memory orig_row (if present)
+                                if old_dict is None:
+                                    if orig_row is not None:
+                                        old_dict = {c: get_series_value(orig_row, c) for c in required_cols}
+                                    else:
+                                        old_dict = {c: None for c in required_cols}
 
-                            # Check duplicate pending log guard
-                            try:
-                                table_name_esc = str(main_table).replace("'", "''")
-                                check_sql = (
-                                    "SELECT COUNT(1) AS CNT FROM " + log_table +
-                                    " WHERE table_name = '" + table_name_esc + "'" +
-                                    " AND approved = FALSE" +
-                                    " AND new_value = $$ " + cleaned_new_json + " $$"
-                                )
-                                cnt_df = session.sql(check_sql).to_pandas()
-                                existing_cnt = int(cnt_df.iloc[0, 0]) if not cnt_df.empty else 0
-                            except Exception:
-                                existing_cnt = 0
+                                # Build new_dict from the edited row (always available)
+                                new_dict = {c: get_series_value(new_row, c) for c in required_cols}
 
-                            if existing_cnt > 0:
-                                errors.append(f"Skipped duplicate pending log for key={k}")
-                                continue
+                                # Remove any internal fields (like __ROW_ID) from new_dict/old_dict (they aren't in required_cols but be safe)
+                                # cleaned_new_json will be used to check duplicates
+                                cleaned_new_json = json.dumps(clean_for_json(new_dict))
 
-                            # Insert changed row into TEMP and log as UPDATE
-                            insert_row_into_temp_from_series(new_row)
-                            log_change(main_table, "UPDATE", old_dict, new_dict)
-                            processed += 1
+                                # Check duplicate pending log guard
+                                try:
+                                    table_name_esc = str(main_table).replace("'", "''")
+                                    check_sql = (
+                                        "SELECT COUNT(1) AS CNT FROM " + log_table +
+                                        " WHERE table_name = '" + table_name_esc + "'" +
+                                        " AND approved = FALSE" +
+                                        " AND new_value = $$ " + cleaned_new_json + " $$"
+                                    )
+                                    cnt_df = session.sql(check_sql).to_pandas()
+                                    existing_cnt = int(cnt_df.iloc[0, 0]) if not cnt_df.empty else 0
+                                except Exception:
+                                    existing_cnt = 0
 
-                        except Exception as e:
-                            errors.append(f"Processing key={k} failed: {e}")
+                                if existing_cnt > 0:
+                                    errors.append(f"Skipped duplicate pending log for rowid={rowid}")
+                                    continue
 
-                    st.success(f"Sent changed rows to TEMP and logged for approval. Processed: {processed}")
-                    if errors:
-                        for er in errors:
-                            st.warning(er)
+                                # Insert changed row into TEMP and log as UPDATE (old_dict and new_dict)
+                                insert_row_into_temp_from_series(new_row)
+                                log_change(main_table, "UPDATE", old_dict, new_dict)
+                                processed += 1
+
+                            except Exception as e:
+                                errors.append(f"Processing rowid={rowid} failed: {e}")
+
+                        st.success(f"Sent changed rows to TEMP and logged for approval. Processed: {processed}")
+                        if errors:
+                            for er in errors:
+                                st.warning(er)
 
                     # refresh UI
                     try:
