@@ -195,6 +195,24 @@ def parse_new_value(val):
         pass
     return {}
 
+# NEW helper to avoid duplicating audit columns in INSERT
+def extend_with_audit_columns(cols_list, vals_list):
+    """
+    Given lists cols_list and vals_list (strings for SQL), return (cols_filtered, vals_filtered)
+    with audit columns removed from the incoming lists so they can be safely appended.
+    """
+    audit_cols = {"CADIS_SYSTEM_INSERTED", "CADIS_SYSTEM_UPDATED", "CADIS_SYSTEM_CHANGEDBY", "DSMNUMBER"}
+    cols_filtered = []
+    vals_filtered = []
+    for i, c in enumerate(cols_list):
+        try:
+            if str(c).upper() in audit_cols:
+                continue
+        except Exception:
+            pass
+        cols_filtered.append(c)
+        vals_filtered.append(vals_list[i])
+    return cols_filtered, vals_filtered
 
 def find_log_table_for_main(main_table_name):
     for info in main_tables.values():
@@ -608,9 +626,10 @@ def render_table_ui(tab, table_key):
                                             raw = parsed_new.get(col.lower(), parsed_new.get(col.upper(), None))
                                         vals_parts.append(coerce_value_for_column(col, raw, main_col_types))
 
-                                    # include audit columns for main insert
-                                    cols_extended = cols_from_new + ["CADIS_SYSTEM_INSERTED", "CADIS_SYSTEM_CHANGEDBY"]
-                                    vals_extended = vals_parts + ["CURRENT_TIMESTAMP", "'business_user'"]
+                                    # Safe extend with audit columns (remove any audit cols from incoming lists first)
+                                    cols_clean, vals_clean = extend_with_audit_columns(cols_from_new, vals_parts)
+                                    cols_extended = cols_clean + ["CADIS_SYSTEM_INSERTED", "CADIS_SYSTEM_CHANGEDBY"]
+                                    vals_extended = vals_clean + ["CURRENT_TIMESTAMP", "'business_user'"]
                                     insert_sql = "INSERT INTO " + main_table_name + " (" + ", ".join(cols_extended) + ") VALUES (" + ", ".join(vals_extended) + ")"
                                     try:
                                         exec_sql(insert_sql)
@@ -634,8 +653,9 @@ def render_table_ui(tab, table_key):
                                                         where_parts.append(f"{kcol.upper()} = {coerce_value_for_column(kcol, vcol, main_col_types)}")
                                                 fallback_where = " AND ".join(where_parts) if where_parts else None
                                             if fallback_set_clause and fallback_where:
-                                                # append audit updates
-                                                fallback_set_clause = fallback_set_clause + ", CADIS_SYSTEM_UPDATED = CURRENT_TIMESTAMP, CADIS_SYSTEM_CHANGEDBY = 'business_user'"
+                                                # append audit updates only if not already present
+                                                if "CADIS_SYSTEM_UPDATED" not in fallback_set_clause.upper():
+                                                    fallback_set_clause = fallback_set_clause + ", CADIS_SYSTEM_UPDATED = CURRENT_TIMESTAMP, CADIS_SYSTEM_CHANGEDBY = 'business_user'"
                                                 update_sql = "UPDATE " + main_table_name + " SET " + fallback_set_clause + " WHERE " + fallback_where
                                                 exec_sql(update_sql)
                                                 processed += 1
@@ -673,8 +693,9 @@ def render_table_ui(tab, table_key):
                                         where_clause = " AND ".join(where_parts) if where_parts else None
 
                                     if set_clause and where_clause:
-                                        # append audit updates
-                                        set_clause = set_clause + ", CADIS_SYSTEM_UPDATED = CURRENT_TIMESTAMP, CADIS_SYSTEM_CHANGEDBY = 'business_user'"
+                                        # append audit updates (avoid duplicate)
+                                        if "CADIS_SYSTEM_UPDATED" not in set_clause.upper():
+                                            set_clause = set_clause + ", CADIS_SYSTEM_UPDATED = CURRENT_TIMESTAMP, CADIS_SYSTEM_CHANGEDBY = 'business_user'"
                                         update_sql = "UPDATE " + main_table_name + " SET " + set_clause + " WHERE " + where_clause
                                         exec_sql(update_sql)
                                         processed += 1
@@ -697,9 +718,10 @@ def render_table_ui(tab, table_key):
                                                 raw = parsed_new.get(col.lower(), parsed_new.get(col.upper(), None))
                                             vals_parts.append(coerce_value_for_column(col, raw, main_col_types))
 
-                                        # include audit columns for insert fallback
-                                        cols_extended = cols_from_new + ["CADIS_SYSTEM_INSERTED", "CADIS_SYSTEM_CHANGEDBY"]
-                                        vals_extended = vals_parts + ["CURRENT_TIMESTAMP", "'business_user'"]
+                                        # Safe extend with audit columns for fallback insert
+                                        cols_clean, vals_clean = extend_with_audit_columns(cols_from_new, vals_parts)
+                                        cols_extended = cols_clean + ["CADIS_SYSTEM_INSERTED", "CADIS_SYSTEM_CHANGEDBY"]
+                                        vals_extended = vals_clean + ["CURRENT_TIMESTAMP", "'business_user'"]
                                         insert_sql = "INSERT INTO " + main_table_name + " (" + ", ".join(cols_extended) + ") VALUES (" + ", ".join(vals_extended) + ")"
                                         try:
                                             exec_sql(insert_sql)
@@ -722,7 +744,8 @@ def render_table_ui(tab, table_key):
                                                             where_parts.append(f"{kcol.upper()} = {coerce_value_for_column(kcol, vcol, main_col_types)}")
                                                     fb_where = " AND ".join(where_parts) if where_parts else None
                                                 if fb_set_clause and fb_where:
-                                                    fb_set_clause = fb_set_clause + ", CADIS_SYSTEM_UPDATED = CURRENT_TIMESTAMP, CADIS_SYSTEM_CHANGEDBY = 'business_user'"
+                                                    if "CADIS_SYSTEM_UPDATED" not in fb_set_clause.upper():
+                                                        fb_set_clause = fb_set_clause + ", CADIS_SYSTEM_UPDATED = CURRENT_TIMESTAMP, CADIS_SYSTEM_CHANGEDBY = 'business_user'"
                                                     update_sql = "UPDATE " + main_table_name + " SET " + fb_set_clause + " WHERE " + fb_where
                                                     exec_sql(update_sql)
                                                     processed += 1
@@ -799,8 +822,9 @@ def render_table_ui(tab, table_key):
                                             raw = parsed_new.get(col.lower(), parsed_new.get(col.upper(), None))
                                         vals_parts.append(coerce_value_for_column(col, raw, main_col_types))
 
-                                    cols_extended = cols_from_new + ["CADIS_SYSTEM_INSERTED", "CADIS_SYSTEM_CHANGEDBY"]
-                                    vals_extended = vals_parts + ["CURRENT_TIMESTAMP", "'business_user'"]
+                                    cols_clean, vals_clean = extend_with_audit_columns(cols_from_new, vals_parts)
+                                    cols_extended = cols_clean + ["CADIS_SYSTEM_INSERTED", "CADIS_SYSTEM_CHANGEDBY"]
+                                    vals_extended = vals_clean + ["CURRENT_TIMESTAMP", "'business_user'"]
                                     insert_sql = "INSERT INTO " + main_table_name + " (" + ", ".join(cols_extended) + ") VALUES (" + ", ".join(vals_extended) + ")"
                                     try:
                                         exec_sql(insert_sql)
@@ -823,7 +847,8 @@ def render_table_ui(tab, table_key):
                                                         where_parts.append(f"{kcol.upper()} = {coerce_value_for_column(kcol, vcol, main_col_types)}")
                                                 fb_where = " AND ".join(where_parts) if where_parts else None
                                             if fb_set_clause and fb_where:
-                                                fb_set_clause = fb_set_clause + ", CADIS_SYSTEM_UPDATED = CURRENT_TIMESTAMP, CADIS_SYSTEM_CHANGEDBY = 'business_user'"
+                                                if "CADIS_SYSTEM_UPDATED" not in fb_set_clause.upper():
+                                                    fb_set_clause = fb_set_clause + ", CADIS_SYSTEM_UPDATED = CURRENT_TIMESTAMP, CADIS_SYSTEM_CHANGEDBY = 'business_user'"
                                                 exec_sql("UPDATE " + main_table_name + " SET " + fb_set_clause + " WHERE " + fb_where)
                                                 processed += 1
                                             else:
