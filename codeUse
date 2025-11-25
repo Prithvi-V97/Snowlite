@@ -812,7 +812,7 @@ def render_table_ui(tab, table_key):
         if main_df is None or main_df.empty:
             st.info("Main table empty or could not be fetched.")
         else:
-            st.markdown("**Tip:** Click 'Enable Editing' to toggle edit mode. When edit mode is ON, you can edit cells. Click 'Send Edits to Approval' to send changed rows to TEMP & log them.")
+            st.markdown("**Tip:** Click 'Enable Editing' to toggle edit mode. When edit mode is ON, you can edit cells. Use the selection checkboxes below to select rows and then either 'Send Selected to Approval' (propose an update/insert) or 'Delete Selected (propose)'. MAIN is not changed until approval.")
 
             edit_key = f"main_edit_enabled_{table_key}"
             if edit_key not in st.session_state:
@@ -823,7 +823,7 @@ def render_table_ui(tab, table_key):
                 st.session_state[edit_key] = not st.session_state[edit_key]
 
             if st.session_state[edit_key]:
-                st.success("Edit mode enabled — edit cells and then click 'Send Edits to Approval'.")
+                st.success("Edit mode enabled — edit cells and then use the selection UI to propose changes.")
             else:
                 st.info("Edit mode disabled — table is read-only.")
 
@@ -870,23 +870,26 @@ def render_table_ui(tab, table_key):
                 edited_data = edited_data.loc[:, ~edited_data.columns.duplicated()]
 
             # ------------------------
-            # Delete selected rows from MAIN (propose DELETE -> copy MAIN row into TEMP & log)
+            # Selection UI (single place for both "Send to Approval" and "Delete")
             # ------------------------
+            # Use the currently displayed table for selection: prefer edited_data (reflects user edits) when edit mode on
+            selection_source_df = edited_data if (st.session_state[edit_key] and edited_data is not None) else display_df
+            # Keep only required_cols for selection display (so UI is compact)
             try:
-                sel_df = display_df[required_cols].copy().reset_index(drop=False)  # keep original index in 'index' column
+                sel_df = selection_source_df[required_cols].copy().reset_index(drop=False)  # keep original index in 'index' column
                 sel_df = sel_df.rename(columns={"index": "_orig_row_index"})
             except Exception:
-                sel_df = display_df.copy().reset_index(drop=False)
+                sel_df = selection_source_df.copy().reset_index(drop=False)
                 sel_df = sel_df.rename(columns={"index": "_orig_row_index"})
 
-            sel_key = f"main_delete_select_{table_key}"
+            sel_key = f"main_row_select_{table_key}"
             if sel_key not in st.session_state or len(st.session_state[sel_key]) != len(sel_df):
                 st.session_state[sel_key] = [False] * len(sel_df)
 
-            sel_df["delete"] = st.session_state[sel_key]
+            sel_df["selected"] = st.session_state[sel_key]
 
-            col_conf = {c: st.column_config.Column(disabled=True) for c in sel_df.columns if c != "delete"}
-            col_conf["delete"] = st.column_config.CheckboxColumn("Delete", help="Tick to propose delete (moves to TEMP & logs)")
+            col_conf = {c: st.column_config.Column(disabled=True) for c in sel_df.columns if c != "selected"}
+            col_conf["selected"] = st.column_config.CheckboxColumn("Select", help="Tick to select this row for action")
 
             edited_selection = st.data_editor(
                 sel_df,
@@ -894,89 +897,248 @@ def render_table_ui(tab, table_key):
                 height=300,
                 column_config=col_conf,
                 hide_index=True,
-                key=f"data_editor_main_delete_{table_key}"
+                key=f"data_editor_main_select_{table_key}"
             )
 
             # sync checkboxes back to session state
-            if "delete" in edited_selection.columns:
-                st.session_state[sel_key] = list(edited_selection["delete"])
+            if "selected" in edited_selection.columns:
+                st.session_state[sel_key] = list(edited_selection["selected"])
 
-            if st.button(f"Delete Selected from MAIN (propose) for {table_key}", key=f"btn_delete_selected_{table_key}"):
-                try:
-                    to_delete = []
-                    if sel_key in st.session_state:
-                        sel_flags = st.session_state[sel_key]
+            # Two action buttons for selected rows: Send to Approval or Delete (propose)
+            col1, col2 = st.columns(2)
+            with col1:
+                if st.button(f"Send Selected to Approval for {table_key}", key=f"btn_send_selected_{table_key}"):
+                    try:
+                        sel_flags = st.session_state.get(sel_key, [])
+                        to_process = []
                         for i, flag in enumerate(sel_flags):
                             if flag:
                                 try:
                                     orig_idx = int(sel_df.iloc[i]["_orig_row_index"])
-                                    main_row_series = display_df.iloc[orig_idx] if orig_idx < len(display_df) else None
+                                    row_series = selection_source_df.iloc[orig_idx] if orig_idx < len(selection_source_df) else sel_df.iloc[i]
                                 except Exception:
-                                    main_row_series = sel_df.iloc[i]
-
-                                if main_row_series is None:
-                                    continue
-                                main_row = {}
+                                    row_series = sel_df.iloc[i]
+                                # build plain dict new_row from row_series
+                                new_row = {}
                                 for c in required_cols:
                                     try:
-                                        v = main_row_series.get(c)
+                                        v = row_series.get(c)
                                     except Exception:
                                         v = None
-                                    main_row[c] = normalize_string(v) if isinstance(v, str) else v
-                                to_delete.append(main_row)
+                                    new_row[c] = normalize_string(v) if isinstance(v, str) else v
+                                to_process.append(new_row)
 
-                    if not to_delete:
-                        st.warning("No rows selected for deletion.")
-                    else:
-                        inserted = 0
-                        errors = []
-                        for main_row in to_delete:
-                            try:
-                                # Build new_temp_row from main_row (full copy of required cols)
-                                new_temp_row = {}
-                                for c in required_cols:
-                                    v = main_row.get(c)
-                                    new_temp_row[c] = normalize_string(v) if isinstance(v, str) else v
-
-                                # Insert into TEMP
-                                cols_sql = ", ".join(required_cols)
-                                vals_sql_parts = []
-                                for c in required_cols:
-                                    v = new_temp_row.get(c)
-                                    if v is None or v == "":
-                                        vals_sql_parts.append("NULL")
+                        if not to_process:
+                            st.warning("No rows selected to send for approval.")
+                        else:
+                            processed = 0
+                            errors = []
+                            for new_row in to_process:
+                                try:
+                                    # Build key inputs from new_row to locate old MAIN row
+                                    key_inputs = {}
+                                    if isinstance(key_cols, (list, tuple)):
+                                        for kc in key_cols:
+                                            key_inputs[kc] = new_row.get(kc)
                                     else:
-                                        vals_sql_parts.append("'" + str(v).replace("'", "''") + "'")
-                                vals_sql = ", ".join(vals_sql_parts)
-                                session.sql("INSERT INTO " + temp_table + " (" + cols_sql + ") VALUES (" + vals_sql + ")").collect()
+                                        key_inputs[key_cols] = new_row.get(key_cols)
 
-                                # Log DELETE (old_value = main_row, new_value = None)
-                                old_row_clean = clean_for_json(main_row)
-                                log_change(main_table, "DELETE", old_row_clean, None)
-                                inserted += 1
-                            except Exception as e:
-                                errors.append(str(e))
-                        st.success(str(inserted) + " selected row(s) copied to TEMP and DELETE logged for approval.")
-                        if errors:
-                            for er in errors:
-                                st.warning("Error for a row: " + er)
+                                    where_clause = build_where_from_key_inputs(key_cols, key_inputs)
+                                    main_row = None
+                                    if where_clause:
+                                        sel_main_sql = "SELECT * FROM " + main_table + " WHERE " + where_clause + " LIMIT 1"
+                                        try:
+                                            main_df_sel = session.sql(sel_main_sql).to_pandas()
+                                        except Exception:
+                                            main_df_sel = session.sql("SELECT * FROM " + main_table + " WHERE " + where_clause).to_pandas()
+                                        if main_df_sel is not None and not main_df_sel.empty:
+                                            main_row = main_df_sel.iloc[0].to_dict()
 
-                        # refresh UI so selected rows no longer show
-                        try:
-                            if hasattr(st, "experimental_rerun"):
-                                st.experimental_rerun()
-                            elif hasattr(st, "rerun"):
-                                st.rerun()
-                            else:
-                                import streamlit.components.v1 as components
-                                components.html("<script>window.location.reload()</script>", height=0)
-                        except Exception:
-                            pass
+                                    # Prepare old_dict from MAIN if found, else None (or attempt TEMP?)
+                                    old_dict = {}
+                                    if main_row is not None:
+                                        for c in required_cols:
+                                            v = main_row.get(c)
+                                            old_dict[c] = normalize_string(v) if isinstance(v, str) else v
+                                    else:
+                                        # attempt to find in TEMP as a fallback (so old value captured if exists in TEMP)
+                                        temp_where = build_where_from_dict({kc: new_row.get(kc) for kc in (key_cols if isinstance(key_cols, (list, tuple)) else [key_cols])})
+                                        temp_row = None
+                                        if temp_where:
+                                            try:
+                                                temp_df = session.sql("SELECT * FROM " + temp_table + " WHERE " + temp_where + " LIMIT 1").to_pandas()
+                                            except Exception:
+                                                temp_df = session.sql("SELECT * FROM " + temp_table + " WHERE " + temp_where).to_pandas()
+                                            if temp_df is not None and not temp_df.empty:
+                                                temp_row = temp_df.iloc[0].to_dict()
+                                        if temp_row is not None:
+                                            for c in required_cols:
+                                                v = temp_row.get(c)
+                                                old_dict[c] = normalize_string(v) if isinstance(v, str) else v
+                                        else:
+                                            old_dict = {c: None for c in required_cols}
 
-                except Exception as e:
-                    st.error("Failed to process delete selections: " + str(e))
+                                    # Insert new_row into TEMP
+                                    cols_sql = ", ".join(required_cols)
+                                    vals_sql_parts = []
+                                    for c in required_cols:
+                                        v = new_row.get(c)
+                                        if v is None or v == "":
+                                            vals_sql_parts.append("NULL")
+                                        else:
+                                            vals_sql_parts.append("'" + str(v).replace("'", "''") + "'")
+                                    vals_sql = ", ".join(vals_sql_parts)
+                                    session.sql("INSERT INTO " + temp_table + " (" + cols_sql + ") VALUES (" + vals_sql + ")").collect()
 
-            # --- Send Edits to Approval (detect diffs and send only changed rows) ---
+                                    # Log UPDATE (old_dict may contain None if not found)
+                                    log_change(main_table, "UPDATE" if any(old_dict.values()) else "INSERT", old_dict if any(old_dict.values()) else None, new_row)
+                                    processed += 1
+                                except Exception as e:
+                                    errors.append(str(e))
+
+                            st.success(f"Sent {processed} selected row(s) to TEMP and logged for approval.")
+                            if errors:
+                                for er in errors:
+                                    st.warning("Error for a row: " + er)
+
+                            # refresh UI
+                            try:
+                                if hasattr(st, "experimental_rerun"):
+                                    st.experimental_rerun()
+                                elif hasattr(st, "rerun"):
+                                    st.rerun()
+                                else:
+                                    import streamlit.components.v1 as components
+                                    components.html("<script>window.location.reload()</script>", height=0)
+                            except Exception:
+                                pass
+                    except Exception as e:
+                        st.error("Failed to send selected rows to approval: " + str(e))
+
+            with col2:
+                if st.button(f"Delete Selected (propose) for {table_key}", key=f"btn_delete_selected_{table_key}"):
+                    try:
+                        sel_flags = st.session_state.get(sel_key, [])
+                        to_delete = []
+                        for i, flag in enumerate(sel_flags):
+                            if flag:
+                                try:
+                                    orig_idx = int(sel_df.iloc[i]["_orig_row_index"])
+                                    row_series = selection_source_df.iloc[orig_idx] if orig_idx < len(selection_source_df) else sel_df.iloc[i]
+                                except Exception:
+                                    row_series = sel_df.iloc[i]
+                                # build plain dict from row_series (this is the values user sees)
+                                main_row_values = {}
+                                for c in required_cols:
+                                    try:
+                                        v = row_series.get(c)
+                                    except Exception:
+                                        v = None
+                                    main_row_values[c] = normalize_string(v) if isinstance(v, str) else v
+                                to_delete.append(main_row_values)
+
+                        if not to_delete:
+                            st.warning("No rows selected for delete.")
+                        else:
+                            processed = 0
+                            errors = []
+                            for main_row in to_delete:
+                                try:
+                                    # Build key inputs from main_row to locate true MAIN row
+                                    key_inputs = {}
+                                    if isinstance(key_cols, (list, tuple)):
+                                        for kc in key_cols:
+                                            key_inputs[kc] = main_row.get(kc)
+                                    else:
+                                        key_inputs[key_cols] = main_row.get(key_cols)
+
+                                    where_clause = build_where_from_key_inputs(key_cols, key_inputs)
+
+                                    # Fetch MAIN row authoritative if possible (to capture full old row)
+                                    main_row_auth = None
+                                    if where_clause:
+                                        try:
+                                            mdf = session.sql("SELECT * FROM " + main_table + " WHERE " + where_clause + " LIMIT 1").to_pandas()
+                                        except Exception:
+                                            mdf = session.sql("SELECT * FROM " + main_table + " WHERE " + where_clause).to_pandas()
+                                        if mdf is not None and not mdf.empty:
+                                            main_row_auth = mdf.iloc[0].to_dict()
+
+                                    # If found in MAIN, copy full MAIN row into TEMP and log DELETE
+                                    if main_row_auth is not None:
+                                        main_row_norm = {str(k): (normalize_string(v) if isinstance(v, str) else v) for k, v in main_row_auth.items()}
+                                        old_row_clean = clean_for_json(main_row_norm)
+
+                                        # Build TEMP row values from MAIN row (full copy)
+                                        new_temp_row = {}
+                                        for c in required_cols:
+                                            v = main_row_auth.get(c)
+                                            if isinstance(v, str):
+                                                new_temp_row[c] = normalize_string(v)
+                                            else:
+                                                new_temp_row[c] = v
+
+                                        # Insert into TEMP
+                                        cols_sql = ", ".join(required_cols)
+                                        vals_sql_parts = []
+                                        for c in required_cols:
+                                            v = new_temp_row.get(c)
+                                            if v is None or v == "":
+                                                vals_sql_parts.append("NULL")
+                                            else:
+                                                vals_sql_parts.append("'" + str(v).replace("'", "''") + "'")
+                                        vals_sql = ", ".join(vals_sql_parts)
+                                        session.sql("INSERT INTO " + temp_table + " (" + cols_sql + ") VALUES (" + vals_sql + ")").collect()
+
+                                        # Log DELETE
+                                        log_change(main_table, "DELETE", old_row_clean, None)
+                                        processed += 1
+                                    else:
+                                        # If not found in MAIN, try TEMP for direct delete (i.e., delete from TEMP and log)
+                                        if where_clause:
+                                            try:
+                                                temp_df = session.sql("SELECT * FROM " + temp_table + " WHERE " + where_clause + " LIMIT 1").to_pandas()
+                                            except Exception:
+                                                temp_df = session.sql("SELECT * FROM " + temp_table + " WHERE " + where_clause).to_pandas()
+                                            if temp_df is not None and not temp_df.empty:
+                                                old_row_dict = temp_df.iloc[0].to_dict()
+                                                old_row_norm = {str(k): (normalize_string(v) if isinstance(v, str) else v) for k, v in old_row_dict.items()}
+                                                old_row_clean = clean_for_json(old_row_norm)
+
+                                                # Delete from TEMP
+                                                session.sql("DELETE FROM " + temp_table + " WHERE " + where_clause).collect()
+
+                                                # Log DELETE
+                                                log_change(main_table, "DELETE", old_row_clean, None)
+                                                processed += 1
+                                            else:
+                                                errors.append("No matching row found in MAIN or TEMP for delete with key: " + str(key_inputs))
+                                        else:
+                                            errors.append("Could not build where clause to locate main row for delete: " + str(key_inputs))
+                                except Exception as e:
+                                    errors.append(str(e))
+
+                            st.success(f"Processed delete for {processed} selected row(s) (copied to TEMP and logged).")
+                            if errors:
+                                for er in errors:
+                                    st.warning("Error for a row: " + er)
+
+                            # refresh UI
+                            try:
+                                if hasattr(st, "experimental_rerun"):
+                                    st.experimental_rerun()
+                                elif hasattr(st, "rerun"):
+                                    st.rerun()
+                                else:
+                                    import streamlit.components.v1 as components
+                                    components.html("<script>window.location.reload()</script>", height=0)
+                            except Exception:
+                                pass
+
+                    except Exception as e:
+                        st.error("Failed to delete selected rows: " + str(e))
+
+            # --- previous "Send Edits to Approval" (kept for backward compatibility) ---
             if st.button("Send Edits to Approval", key=f"send_edits_{table_key}"):
                 try:
                     ensure_session()
@@ -1237,7 +1399,7 @@ def render_table_ui(tab, table_key):
                 except Exception as e:
                     st.error("Manual insert failed: " + str(e))
 
-        # Delete in TEMP
+        # Delete in TEMP (individual delete form — unchanged)
         st.subheader("Delete Record (from TEMP Table)")
         with st.form(f"delete_form_{table_key}"):
             del_key_inputs = {}
