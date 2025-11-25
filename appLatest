@@ -184,12 +184,26 @@ def log_change(main_table_name, action, old_value=None, new_value=None):
     log_table = find_log_table_for_main(main_table_name)
     if not log_table:
         raise ValueError(f"No log table mapping for main table {main_table_name}")
-    cleaned_old = clean_for_json(old_value) if old_value is not None else None
-    cleaned_new = clean_for_json(new_value) if new_value is not None else None
+
+    # Defensive deep copy so later mutations don't affect what's logged
+    try:
+        import copy
+        old_copy = copy.deepcopy(old_value)
+        new_copy = copy.deepcopy(new_value)
+    except Exception:
+        old_copy = old_value
+        new_copy = new_value
+
+    cleaned_old = clean_for_json(old_copy) if old_copy is not None else None
+    cleaned_new = clean_for_json(new_copy) if new_copy is not None else None
+
+    # Ensure we serialize here and freeze the JSON string
     old_json = json.dumps(cleaned_old) if cleaned_old is not None else None
     new_json = json.dumps(cleaned_new) if cleaned_new is not None else None
+
     old_sql_val = "$$ " + old_json + " $$" if old_json is not None else "NULL"
     new_sql_val = "$$ " + new_json + " $$" if new_json is not None else "NULL"
+
     insert_sql = (
         "INSERT INTO " + log_table + " "
         "(action, table_name, old_value, new_value, changed_by, changed_at, approved) VALUES ("
@@ -948,11 +962,19 @@ def render_table_ui(tab, table_key):
                                 continue
 
                             # DB-first authoritative old_dict fetch
-                            old_dict = {c: get_series_value(old_row, c) for c in required_cols} if old_row is not None else {c: None for c in required_cols}
-                            # Fallback: in-memory old_row only if DB returns no row
-                            # ---------------------------
-                            # Build new_dict from the edited row (always available)
-                            new_dict = {c: get_series_value(new_row, c) for c in required_cols}
+                            old_dict = {}
+                            if old_row is not None:
+                                for c in required_cols:
+                                    v = get_series_value(old_row, c)
+                                    old_dict[c] = normalize_string(v) if isinstance(v, str) else v
+                            else:
+                                for c in required_cols:
+                                    old_dict[c] = None
+
+                            new_dict = {}
+                            for c in required_cols:
+                                v = get_series_value(new_row, c)
+                                new_dict[c] = normalize_string(v) if isinstance(v, str) else v
                             cleaned_new_json = json.dumps(clean_for_json(new_dict))
 
                             # Check duplicate pending log guard
@@ -1165,9 +1187,11 @@ def render_table_ui(tab, table_key):
                                 update_sql = "UPDATE " + temp_table + " SET " + upd_col + " = '" + new_val_normalized + "' WHERE " + where_clause
                                 session.sql(update_sql).collect()
 
-                                # Log using old value we fetched from TEMP
+                                # Log using old value we fetched from TEMP (defensive plain-dict)
                                 to_log_old = normalize_string(old_val) if isinstance(old_val, str) else old_val
-                                log_change(main_table, "UPDATE", {upd_col: to_log_old}, {upd_col: new_value})
+                                log_old = {upd_col: to_log_old}
+                                log_new = {upd_col: normalize_string(new_value) if isinstance(new_value, str) else new_value}
+                                log_change(main_table, "UPDATE", log_old, log_new)
                                 st.success("Updated row in TEMP and logged old/new values for approval.")
 
                             else:
