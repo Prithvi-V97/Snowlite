@@ -1253,80 +1253,16 @@ def render_table_ui(tab, table_key):
                             vals_sql = ", ".join(vals_sql_parts)
                             session.sql("INSERT INTO " + temp_table + " (" + cols_sql + ") VALUES (" + vals_sql + ")").collect()
 
-                            # ------------- Patching: show debug and confirm log row landed -------------
-                            # If we had an old_source (MAIN or TEMP) -> log as UPDATE with that old_dict and new_row
-                            # Else -> log as INSERT (old_value = None)
+                            # Log the change:
+                            # - If we had an old_source (MAIN or TEMP) -> log as UPDATE with that old_dict and new_row
+                            # - Else -> log as INSERT (old_value = None)
                             if old_source is not None:
-                                # Defensive, immutable payloads
-                                import copy, json as _json
-
-                                payload_old = copy.deepcopy(old_dict)
-                                payload_new = copy.deepcopy(new_row)
-
-                                payload_old_clean = clean_for_json(payload_old)
-                                payload_new_clean = clean_for_json(payload_new)
-
-                                # Debug UI: show payload being logged
-                                st.info("DEBUG: logging UPDATE with these payloads:")
-                                st.json({"old_value_to_log": payload_old_clean, "new_value_to_log": payload_new_clean})
-
-                                # Call the log writer
-                                log_change(main_table, "UPDATE", payload_old_clean, payload_new_clean)
-
-                                # Immediately read back the most recent log row for this table to confirm what landed
-                                try:
-                                    table_name_esc = str(main_table).replace("'", "''")
-                                    recent_log_q = (
-                                        "SELECT log_id, old_value, new_value, changed_at FROM " + find_log_table_for_main(main_table) +
-                                        " WHERE table_name = '" + table_name_esc + "' ORDER BY changed_at DESC LIMIT 1"
-                                    )
-                                    recent_log_df = session.sql(recent_log_q).to_pandas()
-                                    if recent_log_df is not None and not recent_log_df.empty:
-                                        rl = recent_log_df.iloc[0]
-                                        st.info("DEBUG: most recent log row read back from DB:")
-                                        rv_old = rl.get("OLD_VALUE")
-                                        rv_new = rl.get("NEW_VALUE")
-                                        st.text("raw old_value column (DB): " + str(rv_old))
-                                        st.text("raw new_value column (DB): " + str(rv_new))
-                                    else:
-                                        st.warning("DEBUG: Could not read recent log row after logging.")
-                                except Exception as _e:
-                                    st.warning("DEBUG: reading back recent log failed: " + str(_e))
-
-                                st.success("Proposed UPDATE recorded in TEMP and logged for approval (debug shown above).")
-
+                                # defensive plain dicts already constructed; log_change will deepcopy & serialize
+                                log_change(main_table, "UPDATE", old_dict, new_row)
+                                st.success("Proposed UPDATE recorded in TEMP and logged for approval (old value captured from MAIN/TEMP).")
                             else:
-                                # Defensive, immutable payload for INSERT
-                                import copy, json as _json
-                                payload_new = copy.deepcopy(new_row)
-                                payload_new_clean = clean_for_json(payload_new)
-
-                                st.info("DEBUG: logging INSERT with this new_value payload:")
-                                st.json({"new_value_to_log": payload_new_clean})
-
-                                log_change(main_table, "INSERT", None, payload_new_clean)
-
-                                # read back most recent log row to confirm
-                                try:
-                                    table_name_esc = str(main_table).replace("'", "''")
-                                    recent_log_q = (
-                                        "SELECT log_id, old_value, new_value, changed_at FROM " + find_log_table_for_main(main_table) +
-                                        " WHERE table_name = '" + table_name_esc + "' ORDER BY changed_at DESC LIMIT 1"
-                                    )
-                                    recent_log_df = session.sql(recent_log_q).to_pandas()
-                                    if recent_log_df is not None and not recent_log_df.empty:
-                                        rl = recent_log_df.iloc[0]
-                                        st.info("DEBUG: most recent log row read back from DB:")
-                                        rv_old = rl.get("OLD_VALUE")
-                                        rv_new = rl.get("NEW_VALUE")
-                                        st.text("raw old_value column (DB): " + str(rv_old))
-                                        st.text("raw new_value column (DB): " + str(rv_new))
-                                    else:
-                                        st.warning("DEBUG: Could not read recent log row after logging.")
-                                except Exception as _e:
-                                    st.warning("DEBUG: reading back recent log failed: " + str(_e))
-
-                                st.success("Proposed INSERT recorded in TEMP and logged for approval (debug shown above).")
+                                log_change(main_table, "INSERT", None, new_row)
+                                st.success("Proposed INSERT recorded in TEMP and logged for approval.")
 
                         except Exception as e:
                             st.error("Update failed: " + str(e))
