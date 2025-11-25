@@ -1187,7 +1187,7 @@ def render_table_ui(tab, table_key):
                                 update_sql = "UPDATE " + temp_table + " SET " + upd_col + " = '" + new_val_normalized + "' WHERE " + where_clause
                                 session.sql(update_sql).collect()
 
-                                # Read back the updated row from TEMP to get authoritative new_value
+                                # Read back the updated row from TEMP using the same reliable where_clause
                                 try:
                                     temp_new_df = session.sql("SELECT * FROM " + temp_table + " WHERE " + where_clause + " LIMIT 1").to_pandas()
                                 except Exception:
@@ -1244,19 +1244,16 @@ def render_table_ui(tab, table_key):
                                     vals_sql = ", ".join(vals)
                                     session.sql("INSERT INTO " + temp_table + " (" + cols_sql + ") VALUES (" + vals_sql + ")").collect()
 
-                                    # Read back the inserted row from TEMP using the new_row dict to build WHERE
-                                    temp_where_after_insert = build_where_from_dict(new_row)
-                                    new_row_db = None
-                                    if temp_where_after_insert:
-                                        try:
-                                            inserted_df = session.sql("SELECT * FROM " + temp_table + " WHERE " + temp_where_after_insert + " LIMIT 1").to_pandas()
-                                        except Exception:
-                                            inserted_df = session.sql("SELECT * FROM " + temp_table + " WHERE " + temp_where_after_insert).to_pandas()
-                                        if inserted_df is not None and not inserted_df.empty:
-                                            new_row_db = inserted_df.iloc[0].to_dict()
+                                    # Read back the inserted row from TEMP using the reliable where_clause (not build_where_from_dict(new_row))
+                                    try:
+                                        inserted_df = session.sql("SELECT * FROM " + temp_table + " WHERE " + where_clause + " LIMIT 1").to_pandas()
+                                    except Exception:
+                                        inserted_df = session.sql("SELECT * FROM " + temp_table + " WHERE " + where_clause).to_pandas()
 
-                                    # Fallback if we couldn't read back
-                                    if new_row_db is None:
+                                    if inserted_df is not None and not inserted_df.empty:
+                                        new_row_db = inserted_df.iloc[0].to_dict()
+                                    else:
+                                        # Fallback: if cannot read back, use the new_row dict we inserted
                                         new_row_db = new_row
 
                                     # Log as UPDATE (old from MAIN, new from DB-inserted row)
@@ -1287,18 +1284,15 @@ def render_table_ui(tab, table_key):
                                     vals_sql = ", ".join(vals)
                                     session.sql("INSERT INTO " + temp_table + " (" + cols_sql + ") VALUES (" + vals_sql + ")").collect()
 
-                                    # Read back inserted row for authoritative new_value
-                                    temp_where_after_insert = build_where_from_dict(new_row)
-                                    new_row_db = None
-                                    if temp_where_after_insert:
-                                        try:
-                                            inserted_df = session.sql("SELECT * FROM " + temp_table + " WHERE " + temp_where_after_insert + " LIMIT 1").to_pandas()
-                                        except Exception:
-                                            inserted_df = session.sql("SELECT * FROM " + temp_table + " WHERE " + temp_where_after_insert).to_pandas()
-                                        if inserted_df is not None and not inserted_df.empty:
-                                            new_row_db = inserted_df.iloc[0].to_dict()
+                                    # Read back inserted row for authoritative new_value using where_clause
+                                    try:
+                                        inserted_df = session.sql("SELECT * FROM " + temp_table + " WHERE " + where_clause + " LIMIT 1").to_pandas()
+                                    except Exception:
+                                        inserted_df = session.sql("SELECT * FROM " + temp_table + " WHERE " + where_clause).to_pandas()
 
-                                    if new_row_db is None:
+                                    if inserted_df is not None and not inserted_df.empty:
+                                        new_row_db = inserted_df.iloc[0].to_dict()
+                                    else:
                                         new_row_db = new_row
 
                                     # Log as INSERT (old_value = None, new_value = DB-inserted row)
