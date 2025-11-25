@@ -1159,149 +1159,109 @@ def render_table_ui(tab, table_key):
                 if missing_keys:
                     st.error("Please provide all key column values: " + ", ".join(missing_keys))
                 else:
-                    # Build normalized WHERE for TEMP (and MAIN if needed)
+                    # Build normalized WHERE for locating row (MAIN or TEMP)
                     where_clause = build_where_from_key_inputs(key_cols, key_inputs)
                     if not where_clause:
                         st.error("Could not build WHERE clause for update; provide key values.")
                     else:
                         try:
-                            # Normalize new value for SQL usage
-                            new_val_normalized = "" if new_value is None else str(normalize_string(new_value)).replace("'", "''")
+                            # Normalize the new value (plain python)
+                            new_val_norm = normalize_string(new_value) if isinstance(new_value, str) else new_value
 
-                            # 1) Try to find row in TEMP
-                            sel_temp_sql = "SELECT * FROM " + temp_table + " WHERE " + where_clause + " LIMIT 1"
+                            # 1) Try to fetch authoritative old row from MAIN
+                            sel_main_sql = "SELECT * FROM " + main_table + " WHERE " + where_clause + " LIMIT 1"
                             try:
-                                temp_df = session.sql(sel_temp_sql).to_pandas()
+                                main_df_sel = session.sql(sel_main_sql).to_pandas()
                             except Exception:
-                                temp_df = session.sql("SELECT * FROM " + temp_table + " WHERE " + where_clause).to_pandas()
+                                main_df_sel = session.sql("SELECT * FROM " + main_table + " WHERE " + where_clause).to_pandas()
 
-                            if temp_df is not None and not temp_df.empty:
-                                # Row exists in TEMP -> capture old value from TEMP
-                                old_val = None
+                            main_row = None
+                            if main_df_sel is not None and not main_df_sel.empty:
+                                main_row = main_df_sel.iloc[0].to_dict()
+
+                            # 2) If not in MAIN, try TEMP as fallback for old_value
+                            temp_row = None
+                            if main_row is None:
+                                sel_temp_sql = "SELECT * FROM " + temp_table + " WHERE " + where_clause + " LIMIT 1"
                                 try:
-                                    old_val = temp_df.iloc[0].get(upd_col)
+                                    temp_df = session.sql(sel_temp_sql).to_pandas()
                                 except Exception:
-                                    old_val = temp_df.iloc[0].to_dict().get(upd_col)
+                                    temp_df = session.sql("SELECT * FROM " + temp_table + " WHERE " + where_clause).to_pandas()
+                                if temp_df is not None and not temp_df.empty:
+                                    temp_row = temp_df.iloc[0].to_dict()
 
-                                # perform update on TEMP
-                                update_sql = "UPDATE " + temp_table + " SET " + upd_col + " = '" + new_val_normalized + "' WHERE " + where_clause
-                                session.sql(update_sql).collect()
-
-                                # Read back the updated row from TEMP using the same reliable where_clause
-                                try:
-                                    temp_new_df = session.sql("SELECT * FROM " + temp_table + " WHERE " + where_clause + " LIMIT 1").to_pandas()
-                                except Exception:
-                                    temp_new_df = session.sql("SELECT * FROM " + temp_table + " WHERE " + where_clause).to_pandas()
-
-                                if temp_new_df is not None and not temp_new_df.empty:
-                                    new_row_db = temp_new_df.iloc[0].to_dict()
-                                else:
-                                    # As a fallback, use the simple new dict
-                                    new_row_db = {upd_col: normalize_string(new_value) if isinstance(new_value, str) else new_value}
-
-                                # Prepare old/new payloads defensively
-                                log_old = {upd_col: normalize_string(old_val) if isinstance(old_val, str) else old_val}
-                                # Use DB-fetched value for new_value so logging matches DB
-                                log_new = {upd_col: normalize_string(new_row_db.get(upd_col)) if isinstance(new_row_db.get(upd_col), str) else new_row_db.get(upd_col)}
-                                log_change(main_table, "UPDATE", log_old, log_new)
-                                st.success("Updated row in TEMP and logged authoritative old/new values for approval.")
-
+                            # Prepare old_dict (from MAIN if present, else from TEMP, else None)
+                            if main_row is not None:
+                                old_source = main_row
+                            elif temp_row is not None:
+                                old_source = temp_row
                             else:
-                                # Row not in TEMP -> attempt to fetch the old row from MAIN to capture old_value
-                                sel_main_sql = "SELECT * FROM " + main_table + " WHERE " + where_clause + " LIMIT 1"
-                                try:
-                                    main_df_sel = session.sql(sel_main_sql).to_pandas()
-                                except Exception:
-                                    main_df_sel = session.sql("SELECT * FROM " + main_table + " WHERE " + where_clause).to_pandas()
+                                old_source = None
 
-                                if main_df_sel is not None and not main_df_sel.empty:
-                                    # Found in MAIN: capture old values
-                                    main_row = main_df_sel.iloc[0].to_dict()
-                                    main_row_norm = {str(k): (normalize_string(v) if isinstance(v, str) else v) for k, v in main_row.items()}
-                                    old_dict_for_log = clean_for_json(main_row_norm)
+                            old_dict = {}
+                            if old_source is not None:
+                                # normalize string values into plain python dict
+                                for c in required_cols:
+                                    v = old_source.get(c) if isinstance(old_source, dict) else None
+                                    old_dict[c] = normalize_string(v) if isinstance(v, str) else v
+                            else:
+                                for c in required_cols:
+                                    old_dict[c] = None
 
-                                    # Build new row dict for TEMP: fill keys from key_inputs, upd_col from new_value, others NULL
-                                    new_row = {}
-                                    for c in required_cols:
-                                        if isinstance(key_cols, (list, tuple)) and c in key_inputs:
-                                            new_row[c] = normalize_string(key_inputs[c]) if isinstance(key_inputs[c], str) else key_inputs[c]
-                                        elif not isinstance(key_cols, (list, tuple)) and c == key_cols:
-                                            new_row[c] = normalize_string(key_inputs[key_cols]) if isinstance(key_inputs[key_cols], str) else key_inputs[key_cols]
-                                        elif c == upd_col:
-                                            new_row[c] = normalize_string(new_value) if isinstance(new_value, str) else new_value
-                                        else:
-                                            new_row[c] = None
-
-                                    # Insert new_row into TEMP
-                                    cols_sql = ", ".join(required_cols)
-                                    vals = []
-                                    for c in required_cols:
-                                        v = new_row.get(c)
-                                        if v is None or v == "":
-                                            vals.append("NULL")
-                                        else:
-                                            vals.append("'" + str(v).replace("'", "''") + "'")
-                                    vals_sql = ", ".join(vals)
-                                    session.sql("INSERT INTO " + temp_table + " (" + cols_sql + ") VALUES (" + vals_sql + ")").collect()
-
-                                    # Read back the inserted row from TEMP using the reliable where_clause (not build_where_from_dict(new_row))
-                                    try:
-                                        inserted_df = session.sql("SELECT * FROM " + temp_table + " WHERE " + where_clause + " LIMIT 1").to_pandas()
-                                    except Exception:
-                                        inserted_df = session.sql("SELECT * FROM " + temp_table + " WHERE " + where_clause).to_pandas()
-
-                                    if inserted_df is not None and not inserted_df.empty:
-                                        new_row_db = inserted_df.iloc[0].to_dict()
-                                    else:
-                                        # Fallback: if cannot read back, use the new_row dict we inserted
-                                        new_row_db = new_row
-
-                                    # Log as UPDATE (old from MAIN, new from DB-inserted row)
-                                    log_change(main_table, "UPDATE", old_dict_for_log, new_row_db)
-                                    st.success("Row not found in TEMP. Fetched old values from MAIN, inserted edited row into TEMP and logged authoritative UPDATE for approval.")
-
+                            # Build new_row (plain dict) — start from old_source if available to copy other columns
+                            new_row = {}
+                            if old_source is not None:
+                                # copy existing values for all required cols then overwrite upd_col
+                                for c in required_cols:
+                                    v = old_source.get(c)
+                                    new_row[c] = normalize_string(v) if isinstance(v, str) else v
+                                # overwrite the updated column
+                                new_row[upd_col] = new_val_norm
+                                # ensure key columns reflect user-supplied key_inputs (normalized)
+                                if isinstance(key_cols, (list, tuple)):
+                                    for kc in key_cols:
+                                        if key_inputs.get(kc) is not None and key_inputs.get(kc) != "":
+                                            new_row[kc] = normalize_string(key_inputs[kc]) if isinstance(key_inputs[kc], str) else key_inputs[kc]
                                 else:
-                                    # Not in TEMP nor in MAIN -> treat as INSERT into TEMP and log INSERT
-                                    new_row = {}
-                                    for c in required_cols:
-                                        if isinstance(key_cols, (list, tuple)) and c in key_inputs:
-                                            new_row[c] = normalize_string(key_inputs[c]) if isinstance(key_inputs[c], str) else key_inputs[c]
-                                        elif not isinstance(key_cols, (list, tuple)) and c == key_cols:
-                                            new_row[c] = normalize_string(key_inputs[key_cols]) if isinstance(key_inputs[key_cols], str) else key_inputs[key_cols]
-                                        elif c == upd_col:
-                                            new_row[c] = normalize_string(new_value) if isinstance(new_value, str) else new_value
-                                        else:
-                                            new_row[c] = None
-
-                                    cols_sql = ", ".join(required_cols)
-                                    vals = []
-                                    for c in required_cols:
-                                        v = new_row.get(c)
-                                        if v is None or v == "":
-                                            vals.append("NULL")
-                                        else:
-                                            vals.append("'" + str(v).replace("'", "''") + "'")
-                                    vals_sql = ", ".join(vals)
-                                    session.sql("INSERT INTO " + temp_table + " (" + cols_sql + ") VALUES (" + vals_sql + ")").collect()
-
-                                    # Read back inserted row for authoritative new_value using where_clause
-                                    try:
-                                        inserted_df = session.sql("SELECT * FROM " + temp_table + " WHERE " + where_clause + " LIMIT 1").to_pandas()
-                                    except Exception:
-                                        inserted_df = session.sql("SELECT * FROM " + temp_table + " WHERE " + where_clause).to_pandas()
-
-                                    if inserted_df is not None and not inserted_df.empty:
-                                        new_row_db = inserted_df.iloc[0].to_dict()
+                                    if key_inputs.get(key_cols) is not None and key_inputs.get(key_cols) != "":
+                                        new_row[key_cols] = normalize_string(key_inputs[key_cols]) if isinstance(key_inputs[key_cols], str) else key_inputs[key_cols]
+                            else:
+                                # no existing row anywhere: build minimal new_row from keys + updated col
+                                for c in required_cols:
+                                    if isinstance(key_cols, (list, tuple)) and c in key_inputs:
+                                        new_row[c] = normalize_string(key_inputs[c]) if isinstance(key_inputs[c], str) else key_inputs[c]
+                                    elif not isinstance(key_cols, (list, tuple)) and c == key_cols:
+                                        new_row[c] = normalize_string(key_inputs[key_cols]) if isinstance(key_inputs[key_cols], str) else key_inputs[key_cols]
+                                    elif c == upd_col:
+                                        new_row[c] = new_val_norm
                                     else:
-                                        new_row_db = new_row
+                                        new_row[c] = None
 
-                                    # Log as INSERT (old_value = None, new_value = DB-inserted row)
-                                    log_change(main_table, "INSERT", None, new_row_db)
-                                    st.success("Row not found in MAIN or TEMP. Inserted new row into TEMP and logged authoritative INSERT for approval.")
+                            # Insert the new_row into TEMP (always; updates are proposed changes pending approval)
+                            cols_sql = ", ".join(required_cols)
+                            vals_sql_parts = []
+                            for c in required_cols:
+                                v = new_row.get(c)
+                                if v is None or v == "":
+                                    vals_sql_parts.append("NULL")
+                                else:
+                                    vals_sql_parts.append("'" + str(v).replace("'", "''") + "'")
+                            vals_sql = ", ".join(vals_sql_parts)
+                            session.sql("INSERT INTO " + temp_table + " (" + cols_sql + ") VALUES (" + vals_sql + ")").collect()
+
+                            # Log the change:
+                            # - If we had an old_source (MAIN or TEMP) -> log as UPDATE with that old_dict and new_row
+                            # - Else -> log as INSERT (old_value = None)
+                            if old_source is not None:
+                                # defensive plain dicts already constructed; log_change will deepcopy & serialize
+                                log_change(main_table, "UPDATE", old_dict, new_row)
+                                st.success("Proposed UPDATE recorded in TEMP and logged for approval (old value captured from MAIN/TEMP).")
+                            else:
+                                log_change(main_table, "INSERT", None, new_row)
+                                st.success("Proposed INSERT recorded in TEMP and logged for approval.")
 
                         except Exception as e:
                             st.error("Update failed: " + str(e))
-
 
 
         # Delete in TEMP
