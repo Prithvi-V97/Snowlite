@@ -171,6 +171,69 @@ def parse_new_value(val):
     return {}
 
 
+def find_log_table_for_main(main_table_name):
+    """Return the log table name for a main table. Accepts either the full table name
+       as stored in main_tables[*]['name'] or the short key (e.g. 'DDM_XREF_DOMAIN_VALUE')."""
+    if not main_table_name:
+        return None
+    mt_upper = str(main_table_name).strip().upper()
+    # first try exact match to 'name' values
+    for info in main_tables.values():
+        name_val = info.get("name")
+        if name_val and str(name_val).strip().upper() == mt_upper:
+            return info.get("log")
+    # then try matching by the dictionary key
+    for k, info in main_tables.items():
+        if str(k).strip().upper() == mt_upper:
+            return info.get("log")
+    return None
+
+def log_change(main_table_name, action, old_value=None, new_value=None):
+    """Write a log row into the mapped log table. More verbose on failure for debugging."""
+    ensure_session()
+    log_table = find_log_table_for_main(main_table_name)
+    if not log_table:
+        # raise a clear error (caller can catch); include debug info
+        raise ValueError(f"No log table mapping found for main table identifier: {main_table_name}")
+
+    try:
+        import copy
+        old_copy = copy.deepcopy(old_value)
+        new_copy = copy.deepcopy(new_value)
+    except Exception:
+        old_copy = old_value
+        new_copy = new_value
+
+    cleaned_old = clean_for_json(old_copy) if old_copy is not None else None
+    cleaned_new = clean_for_json(new_copy) if new_copy is not None else None
+
+    old_json = json.dumps(cleaned_old) if cleaned_old is not None else None
+    new_json = json.dumps(cleaned_new) if cleaned_new is not None else None
+
+    old_sql_val = "$$ " + old_json + " $$" if old_json is not None else "NULL"
+    new_sql_val = "$$ " + new_json + " $$" if new_json is not None else "NULL"
+
+    insert_sql = (
+        "INSERT INTO " + log_table + " "
+        "(action, table_name, old_value, new_value, changed_by, changed_at, approved) VALUES ("
+        + "'" + str(action) + "', "
+        + "'" + str(main_table_name) + "', "
+        + old_sql_val + ", " + new_sql_val + ", "
+        + "'streamlit_user', CURRENT_TIMESTAMP, FALSE)"
+    )
+    try:
+        session.sql(insert_sql).collect()
+    except Exception as e:
+        # expose SQL and error for debugging in Streamlit
+        st.error("Failed to write to log table: " + str(e))
+        try:
+            st.text("DEBUG: attempted SQL:\n" + insert_sql)
+        except Exception:
+            pass
+        # re-raise so caller sees the failure (optional: you can comment out raise if you prefer swallow)
+        raise
+
+
 # -------------------------
 # Table mappings
 # -------------------------
@@ -422,73 +485,6 @@ def fetch_main_table_sorted(table_name):
         except Exception:
             pass
     return df.reset_index(drop=True)
-
-
-# -------------------------
-# Robust mapping + logging fixes (REPLACED FUNCTIONS)
-# -------------------------
-def find_log_table_for_main(main_table_name):
-    """Return the log table name for a main table. Accepts either the full table name
-       as stored in main_tables[*]['name'] or the short key (e.g. 'DDM_XREF_DOMAIN_VALUE')."""
-    if not main_table_name:
-        return None
-    mt_upper = str(main_table_name).strip().upper()
-    # first try exact match to 'name' values
-    for info in main_tables.values():
-        name_val = info.get("name")
-        if name_val and str(name_val).strip().upper() == mt_upper:
-            return info.get("log")
-    # then try matching by the dictionary key
-    for k, info in main_tables.items():
-        if str(k).strip().upper() == mt_upper:
-            return info.get("log")
-    return None
-
-
-def log_change(main_table_name, action, old_value=None, new_value=None):
-    """Write a log row into the mapped log table. Prints debug info on failure but preserves previous non-raising behavior."""
-    ensure_session()
-    log_table = find_log_table_for_main(main_table_name)
-    if not log_table:
-        # raise a clear error for callers to detect
-        raise ValueError(f"No log table mapping found for main table identifier: {main_table_name}")
-
-    try:
-        import copy
-        old_copy = copy.deepcopy(old_value)
-        new_copy = copy.deepcopy(new_value)
-    except Exception:
-        old_copy = old_value
-        new_copy = new_value
-
-    cleaned_old = clean_for_json(old_copy) if old_copy is not None else None
-    cleaned_new = clean_for_json(new_copy) if new_copy is not None else None
-
-    old_json = json.dumps(cleaned_old) if cleaned_old is not None else None
-    new_json = json.dumps(cleaned_new) if cleaned_new is not None else None
-
-    old_sql_val = "$$ " + old_json + " $$" if old_json is not None else "NULL"
-    new_sql_val = "$$ " + new_json + " $$" if new_json is not None else "NULL"
-
-    insert_sql = (
-        "INSERT INTO " + log_table + " "
-        "(action, table_name, old_value, new_value, changed_by, changed_at, approved) VALUES ("
-        + "'" + str(action) + "', "
-        + "'" + str(main_table_name) + "', "
-        + old_sql_val + ", " + new_sql_val + ", "
-        + "'streamlit_user', CURRENT_TIMESTAMP, FALSE)"
-    )
-    try:
-        session.sql(insert_sql).collect()
-    except Exception as e:
-        # expose SQL and error for debugging in Streamlit, but don't crash the whole flow
-        st.error("Failed to write to log table: " + str(e))
-        try:
-            st.text("DEBUG: attempted SQL:\n" + insert_sql)
-        except Exception:
-            pass
-        # preserve previous behavior by returning (do not re-raise)
-        return
 
 
 # -------------------------
@@ -911,34 +907,7 @@ def render_table_ui(tab, table_key):
                     orig_norm = normalize_key_columns_in_df(orig, key_cols)
                     new_norm = normalize_key_columns_in_df(new, key_cols)
 
-                    # build index maps keyed by stable key
-                    orig_index = {}
-                    new_index = {}
-                    orig_keys = []
-
-                    if not orig_norm.empty:
-                        # Build orig_index and list of orig_keys (ordered by row position)
-                        for _, r in orig_norm.iterrows():
-                            k = get_row_key(r, key_cols)
-                            orig_index[k] = r
-                            orig_keys.append(k)
-
-                    if not new_norm.empty:
-                        # Build new_index but retain mapping to the original key by row position.
-                        # This helps when key columns were edited (so new key != old key).
-                        # We'll use row position to find the corresponding original key if available.
-                        new_rows = list(new_norm.iterrows())
-                        for idx, (_i, r) in enumerate(new_rows):
-                            # prefer the original key at same row index (if present)
-                            if idx < len(orig_keys):
-                                orig_key_for_this_row = orig_keys[idx]
-                            else:
-                                # fallback: compute key from the new row
-                                orig_key_for_this_row = get_row_key(r, key_cols)
-                            # store mapping using a special composite key: orig_key_for_this_row
-                            new_index[orig_key_for_this_row] = r
-
-
+                    # --- Replace old mapping logic with index-based alignment (robust when key columns edited) ---
                     processed = 0
                     errors = []
 
@@ -955,17 +924,47 @@ def render_table_ui(tab, table_key):
                         vals_sql = ", ".join(vals)
                         session.sql("INSERT INTO " + temp_table + " (" + cols_sql + ") VALUES (" + vals_sql + ")").collect()
 
-                    # iterate over new rows and compare to orig, send changed rows
-                    for orig_key, new_row in new_index.items():
-                        # Make a readable key for error messages
-                        human_key = orig_key if isinstance(orig_key, (str, tuple)) else str(orig_key)
+                    # Build orig list and dict for key fallback (preserve original code's behavior)
+                    orig_list = []
+                    orig_index = {}
+                    if not orig_norm.empty:
+                        for _, r in orig_norm.iterrows():
+                            orig_list.append(r)
+                            k = get_row_key(r, key_cols)
+                            # preserve list of rows for a key (avoid overwrite)
+                            orig_index.setdefault(k, []).append(r)
+
+                    # Build list of new rows in order (index-based)
+                    new_rows = []
+                    if not new_norm.empty:
+                        for _, r in new_norm.iterrows():
+                            new_rows.append(r)
+
+                    # Now iterate by row position to find matching orig row (best), fallback to key lookup
+                    for idx in range(len(new_rows)):
+                        new_row = new_rows[idx]
+                        # readable key for diagnostics
                         try:
-                            # old_row is retrieved by the original key we stored earlier (position-based)
-                            old_row = orig_index.get(orig_key)
+                            old_row = orig_list[idx] if idx < len(orig_list) else None
+                        except Exception:
+                            old_row = None
+
+                        # If old_row is None, try to find by key derived from new_row (use get_row_key)
+                        if old_row is None:
+                            fallback_key = get_row_key(new_row, key_cols)
+                            candidate_list = orig_index.get(fallback_key)
+                            if candidate_list:
+                                # choose the first candidate
+                                old_row = candidate_list[0]
+                            else:
+                                old_row = None
+
+                        # compare required_cols between old_row and new_row
+                        try:
+                            changed = False
                             if old_row is None:
                                 changed = True
                             else:
-                                changed = False
                                 for c in required_cols:
                                     o_val = get_series_value(old_row, c)
                                     n_val = get_series_value(new_row, c)
@@ -983,7 +982,7 @@ def render_table_ui(tab, table_key):
                             if not changed:
                                 continue
 
-                            # DB-first authoritative old_dict fetch
+                            # Build old_dict from old_row (if present)
                             old_dict = {}
                             if old_row is not None:
                                 for c in required_cols:
@@ -993,13 +992,14 @@ def render_table_ui(tab, table_key):
                                 for c in required_cols:
                                     old_dict[c] = None
 
+                            # Build new_dict from new_row
                             new_dict = {}
                             for c in required_cols:
                                 v = get_series_value(new_row, c)
                                 new_dict[c] = normalize_string(v) if isinstance(v, str) else v
                             cleaned_new_json = json.dumps(clean_for_json(new_dict))
 
-                            # Check duplicate pending log guard
+                            # Duplicate pending log guard
                             try:
                                 table_name_esc = str(main_table).replace("'", "''")
                                 check_sql = (
@@ -1014,34 +1014,20 @@ def render_table_ui(tab, table_key):
                                 existing_cnt = 0
 
                             if existing_cnt > 0:
-                                errors.append(f"Skipped duplicate pending log for key={human_key}")
+                                errors.append(f"Skipped duplicate pending log for row index={idx}")
                                 continue
 
-                            # Insert changed row into TEMP and log as UPDATE
-                            # DIAGNOSTIC: only show for XREF table to avoid noise for Domain Value
-                            if table_key == "DDM_XREF_DOMAIN_VALUE":
-                                try:
-                                    st.write("DEBUG: main_table variable:", main_table)
-                                    st.write("DEBUG: find_log_table_for_main(main_table):", find_log_table_for_main(main_table))
-                                    st.write("DEBUG: human_key:", human_key)
-                                    st.write("DEBUG: old_dict:", old_dict)
-                                    st.write("DEBUG: new_dict:", new_dict)
-                                    st.write("DEBUG: cleaned_new_json (len):", len(cleaned_new_json))
-                                except Exception:
-                                    pass
-
+                            # Insert into TEMP and log
                             insert_row_into_temp_from_series(new_row)
-                            # call log_change; if it fails we'll get an st.error printed inside log_change
                             try:
                                 log_change(main_table, "UPDATE", old_dict, new_dict)
                             except Exception as e:
-                                # log_change now prints the SQL and returns on failure; but if it raises mapping error, capture it
-                                errors.append(f"Logging failed for key={human_key}: {e}")
+                                errors.append(f"Logging failed for row index={idx}: {e}")
 
                             processed += 1
 
                         except Exception as e:
-                            errors.append(f"Processing key={human_key} failed: {e}")
+                            errors.append(f"Processing row index={idx} failed: {e}")
 
                     st.success(f"Sent changed rows to TEMP and logged for approval. Processed: {processed}")
                     if errors:
@@ -1313,6 +1299,7 @@ def render_table_ui(tab, table_key):
 
                             except Exception as e:
                                 st.error("Delete failed: " + str(e))
+
 
 # Render tabs
 tab1, tab2 = st.tabs(["DDM_DOMAIN_VALUE", "DDM_XREF_DOMAIN_VALUE"])
