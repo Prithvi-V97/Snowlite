@@ -577,6 +577,26 @@ def render_table_ui(tab, table_key):
                     if to_approve.empty:
                         st.warning("No rows selected for approval.")
                     else:
+                        # --- BEGIN ADDED: prevent double-apply of same change within one approval run ---
+                        processed_change_signatures = set()
+
+                        def main_row_exists(table_name_full, row_dict):
+                            try:
+                                where_exist = build_where_from_dict(row_dict)
+                                if not where_exist:
+                                    return False
+                                cnt_q = "SELECT COUNT(1) AS CNT FROM " + table_name_full + " WHERE " + where_exist
+                                cnt_df = session.sql(cnt_q).to_pandas()
+                                if not cnt_df.empty:
+                                    try:
+                                        return int(cnt_df.iloc[0, 0]) > 0
+                                    except Exception:
+                                        return False
+                                return False
+                            except Exception:
+                                return False
+                        # --- END ADDED ---
+
                         processed = 0
                         errors = []
 
@@ -625,6 +645,16 @@ def render_table_ui(tab, table_key):
                             parsed_old = parse_new_value(old_value_db) if old_value_db is not None else {}
                             act = str(action_db).upper() if action_db is not None else "INSERT"
 
+                            # Build a signature early for duplicate-skip protection
+                            try:
+                                cleaned_new_json_for_sig = json.dumps(clean_for_json(parsed_new)) if isinstance(parsed_new, dict) else json.dumps(clean_for_json({}))
+                            except Exception:
+                                cleaned_new_json_for_sig = str(parsed_new)
+                            change_sig = (str(table_name_db).upper(), cleaned_new_json_for_sig)
+                            if change_sig in processed_change_signatures:
+                                errors.append(f"Skipped duplicate application of same change for log_id={log_id} (signature duplicate).")
+                                continue
+
                             try:
                                 # Apply to main table according to action
                                 if act == "INSERT":
@@ -635,9 +665,32 @@ def render_table_ui(tab, table_key):
                                         if raw is None and isinstance(parsed_new, dict):
                                             raw = parsed_new.get(col.lower(), parsed_new.get(col.upper(), None))
                                         vals_parts.append(coerce_value_for_column(col, raw, main_col_types))
-                                    insert_sql = "INSERT INTO " + main_table_name + " (" + ", ".join(cols_from_new) + ") VALUES (" + ", ".join(vals_parts) + ")"
-                                    session.sql(insert_sql).collect()
-                                    processed += 1
+
+                                    # Safety: before inserting, check if main already has this row
+                                    try:
+                                        new_check = {}
+                                        for c in cols_from_new:
+                                            v = parsed_new.get(c) if isinstance(parsed_new, dict) else None
+                                            new_check[c] = normalize_string(v) if isinstance(v, str) else v
+                                        exists_before = main_row_exists(main_table_name, new_check)
+                                    except Exception:
+                                        exists_before = False
+
+                                    if exists_before:
+                                        # consider processed, do not insert duplicate
+                                        processed += 1
+                                        try:
+                                            processed_change_signatures.add(change_sig)
+                                        except Exception:
+                                            pass
+                                    else:
+                                        insert_sql = "INSERT INTO " + main_table_name + " (" + ", ".join(cols_from_new) + ") VALUES (" + ", ".join(vals_parts) + ")"
+                                        session.sql(insert_sql).collect()
+                                        processed += 1
+                                        try:
+                                            processed_change_signatures.add(change_sig)
+                                        except Exception:
+                                            pass
 
                                     # clear temp row for this new value
                                     try:
@@ -685,6 +738,10 @@ def render_table_ui(tab, table_key):
                                         update_sql = "UPDATE " + main_table_name + " SET " + set_clause + " WHERE " + where_clause
                                         session.sql(update_sql).collect()
                                         processed += 1
+                                        try:
+                                            processed_change_signatures.add(change_sig)
+                                        except Exception:
+                                            pass
 
                                         # clear temp row for this new value
                                         try:
@@ -703,9 +760,31 @@ def render_table_ui(tab, table_key):
                                             if raw is None and isinstance(parsed_new, dict):
                                                 raw = parsed_new.get(col.lower(), parsed_new.get(col.upper(), None))
                                             vals_parts.append(coerce_value_for_column(col, raw, main_col_types))
-                                        insert_sql = "INSERT INTO " + main_table_name + " (" + ", ".join(cols_from_new) + ") VALUES (" + ", ".join(vals_parts) + ")"
-                                        session.sql(insert_sql).collect()
-                                        processed += 1
+
+                                        # Check existence first using parsed_new
+                                        try:
+                                            new_dict_for_check = {}
+                                            for c in cols_from_new:
+                                                val = parsed_new.get(c) if isinstance(parsed_new, dict) else None
+                                                new_dict_for_check[c] = normalize_string(val) if isinstance(val, str) else val
+                                            exists = main_row_exists(main_table_name, new_dict_for_check)
+                                        except Exception:
+                                            exists = False
+
+                                        if exists:
+                                            processed += 1
+                                            try:
+                                                processed_change_signatures.add(change_sig)
+                                            except Exception:
+                                                pass
+                                        else:
+                                            insert_sql = "INSERT INTO " + main_table_name + " (" + ", ".join(cols_from_new) + ") VALUES (" + ", ".join(vals_parts) + ")"
+                                            session.sql(insert_sql).collect()
+                                            processed += 1
+                                            try:
+                                                processed_change_signatures.add(change_sig)
+                                            except Exception:
+                                                pass
 
                                         try:
                                             temp_where = build_where_from_dict(parsed_new)
@@ -728,6 +807,10 @@ def render_table_ui(tab, table_key):
                                         delete_sql = "DELETE FROM " + main_table_name + " WHERE " + where_clause
                                         session.sql(delete_sql).collect()
                                         processed += 1
+                                        try:
+                                            processed_change_signatures.add(change_sig)
+                                        except Exception:
+                                            pass
 
                                         # clear temp row for this delete
                                         try:
@@ -749,6 +832,10 @@ def render_table_ui(tab, table_key):
                                             if where_clause2:
                                                 session.sql("DELETE FROM " + main_table_name + " WHERE " + where_clause2).collect()
                                                 processed += 1
+                                                try:
+                                                    processed_change_signatures.add(change_sig)
+                                                except Exception:
+                                                    pass
                                                 try:
                                                     temp_where = build_where_from_dict(parsed_new)
                                                     if temp_where:
@@ -772,9 +859,31 @@ def render_table_ui(tab, table_key):
                                         if raw is None and isinstance(parsed_new, dict):
                                             raw = parsed_new.get(col.lower(), parsed_new.get(col.upper(), None))
                                         vals_parts.append(coerce_value_for_column(col, raw, main_col_types))
-                                    insert_sql = "INSERT INTO " + main_table_name + " (" + ", ".join(cols_from_new) + ") VALUES (" + ", ".join(vals_parts) + ")"
-                                    session.sql(insert_sql).collect()
-                                    processed += 1
+
+                                    # Existence check
+                                    try:
+                                        new_dict_for_check = {}
+                                        for c in cols_from_new:
+                                            val = parsed_new.get(c) if isinstance(parsed_new, dict) else None
+                                            new_dict_for_check[c] = normalize_string(val) if isinstance(val, str) else val
+                                        exists_default = main_row_exists(main_table_name, new_dict_for_check)
+                                    except Exception:
+                                        exists_default = False
+
+                                    if exists_default:
+                                        processed += 1
+                                        try:
+                                            processed_change_signatures.add(change_sig)
+                                        except Exception:
+                                            pass
+                                    else:
+                                        insert_sql = "INSERT INTO " + main_table_name + " (" + ", ".join(cols_from_new) + ") VALUES (" + ", ".join(vals_parts) + ")"
+                                        session.sql(insert_sql).collect()
+                                        processed += 1
+                                        try:
+                                            processed_change_signatures.add(change_sig)
+                                        except Exception:
+                                            pass
                                     try:
                                         temp_where = build_where_from_dict(parsed_new)
                                         if temp_where:
@@ -940,6 +1049,9 @@ def render_table_ui(tab, table_key):
                         for _, r in new_norm.iterrows():
                             new_rows.append(r)
 
+                    # Track processed change signatures within this send_edits run
+                    processed_change_signatures_send = set()
+
                     # Now iterate by row position to find matching orig row (best), fallback to key lookup
                     for idx in range(len(new_rows)):
                         new_row = new_rows[idx]
@@ -999,7 +1111,7 @@ def render_table_ui(tab, table_key):
                                 new_dict[c] = normalize_string(v) if isinstance(v, str) else v
                             cleaned_new_json = json.dumps(clean_for_json(new_dict))
 
-                            # Duplicate pending log guard
+                            # Duplicate pending log guard (existing DB logs)
                             try:
                                 table_name_esc = str(main_table).replace("'", "''")
                                 check_sql = (
@@ -1017,12 +1129,27 @@ def render_table_ui(tab, table_key):
                                 errors.append(f"Skipped duplicate pending log for row index={idx}")
                                 continue
 
+                            # Build signature and skip duplicates within this send_edits run
+                            try:
+                                sig = (str(main_table).upper(), json.dumps(clean_for_json(new_dict)))
+                            except Exception:
+                                sig = (str(main_table).upper(), str(new_dict))
+                            if sig in processed_change_signatures_send:
+                                errors.append(f"Skipped duplicate application for row index={idx} within this run.")
+                                continue
+
                             # Insert into TEMP and log
                             insert_row_into_temp_from_series(new_row)
                             try:
                                 log_change(main_table, "UPDATE", old_dict, new_dict)
                             except Exception as e:
                                 errors.append(f"Logging failed for row index={idx}: {e}")
+
+                            # mark signature as processed for this send_edits run
+                            try:
+                                processed_change_signatures_send.add(sig)
+                            except Exception:
+                                pass
 
                             processed += 1
 
