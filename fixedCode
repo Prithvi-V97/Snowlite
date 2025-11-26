@@ -1,0 +1,1315 @@
+# streamlit_app.py
+import re
+import json
+import ast
+import numpy as np
+import pandas as pd
+import streamlit as st
+from datetime import datetime, date
+from snowflake.snowpark.context import get_active_session
+
+# Optional enhanced grid
+try:
+    from st_aggrid import AgGrid, GridOptionsBuilder, GridUpdateMode, DataReturnMode
+    AGGRID_AVAILABLE = True
+except Exception:
+    AGGRID_AVAILABLE = False
+
+st.set_page_config(layout="wide")
+st.title("DDM Dual Table DML Dashboard")
+
+# -------------------------
+# Snowflake session
+# -------------------------
+try:
+    session = get_active_session()
+except Exception:
+    session = None
+
+# -------------------------
+# Helpers
+# -------------------------
+def ensure_session():
+    """Ensure a global Snowflake session is available."""
+    global session
+    try:
+        if session is None:
+            session = get_active_session()
+        session.sql("SELECT 1").collect()
+        return True
+    except Exception as e:
+        try:
+            session = get_active_session()
+            session.sql("SELECT 1").collect()
+            return True
+        except Exception as e2:
+            st.error("Database session expired or unavailable. Please refresh the app (F5).")
+            with st.expander("Technical details"):
+                st.text(str(e2))
+            st.stop()
+            return False
+
+# Best-effort add openpyxl
+try:
+    if session is not None:
+        session.add_packages("openpyxl")
+except Exception:
+    st.warning("Could not add openpyxl automatically. If Excel upload fails, use CSV instead.")
+
+
+def normalize_string(s):
+    """Strip NBSP and whitespace from strings, collapse multiple spaces, return None for empty."""
+    if s is None:
+        return None
+    if isinstance(s, str):
+        s2 = s.replace("\u00A0", " ")
+        s2 = re.sub(r"\s+", " ", s2).strip()
+        return s2
+    return s
+
+
+def read_uploaded_file(uploaded_file):
+    """Read uploaded .xlsx or .csv and normalize string cells."""
+    try:
+        name = uploaded_file.name.lower()
+        if name.endswith(".xlsx"):
+            df = pd.read_excel(uploaded_file, engine="openpyxl")
+        elif name.endswith(".csv"):
+            try:
+                df = pd.read_csv(uploaded_file, encoding="utf-8")
+            except UnicodeDecodeError:
+                st.warning("File not UTF-8 encoded. Trying ISO-8859-1...")
+                df = pd.read_csv(uploaded_file, encoding="ISO-8859-1")
+        else:
+            st.error("Unsupported file format. Please upload .xlsx or .csv")
+            return None
+        df = df.applymap(lambda x: normalize_string(x) if isinstance(x, str) else x)
+        return df
+    except Exception as e:
+        st.error("Error reading uploaded file: " + str(e))
+        return None
+
+
+def clean_for_json(obj):
+    """Make objects JSON-safe for storing in log table."""
+    if obj is None:
+        return None
+    try:
+        if pd.isna(obj):
+            return None
+    except Exception:
+        pass
+    if isinstance(obj, (pd.Timestamp, datetime)):
+        try:
+            return obj.isoformat()
+        except Exception:
+            return str(obj)
+    if isinstance(obj, date) and not isinstance(obj, datetime):
+        return obj.isoformat()
+    if isinstance(obj, (np.integer,)):
+        return int(obj)
+    if isinstance(obj, (np.floating,)):
+        return float(obj)
+    if isinstance(obj, (np.bool_,)):
+        return bool(obj)
+    if isinstance(obj, dict):
+        return {str(k): clean_for_json(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple, set, pd.Series)):
+        return [clean_for_json(v) for v in obj]
+    if isinstance(obj, (str, int, float, bool)):
+        return obj
+    try:
+        return str(obj)
+    except Exception:
+        return None
+
+
+def sql_literal(v):
+    """Return SQL literal for value v, or NULL."""
+    try:
+        if pd.isna(v):
+            return "NULL"
+    except Exception:
+        pass
+    if v is None:
+        return "NULL"
+    if isinstance(v, (int, float, np.integer, np.floating)) and not isinstance(v, (bool, np.bool_)):
+        return str(v)
+    s = str(v)
+    if re.fullmatch(r"-?\d+(\.\d+)?", s.strip()):
+        return s.strip()
+    return "'" + s.replace("'", "''") + "'"
+
+
+def parse_new_value(val):
+    """Try several parsing strategies for log new_value/old_value."""
+    if val is None:
+        return {}
+    if isinstance(val, dict):
+        return {k: (v.replace("\u00A0", " ").strip() if isinstance(v, str) else v) for k, v in val.items()}
+    s = str(val).strip()
+    if s.startswith("$$") and s.endswith("$$"):
+        s = s[2:-2].strip()
+    try:
+        parsed = json.loads(s)
+        if isinstance(parsed, dict):
+            return {k: (v.replace("\u00A0", " ").strip() if isinstance(v, str) else v) for k, v in parsed.items()}
+    except Exception:
+        pass
+    try:
+        parsed = json.loads(s.replace("'", '"'))
+        if isinstance(parsed, dict):
+            return {k: (v.replace("\u00A0", " ").strip() if isinstance(v, str) else v) for k, v in parsed.items()}
+    except Exception:
+        pass
+    try:
+        parsed = ast.literal_eval(s)
+        if isinstance(parsed, dict):
+            return {k: (v.replace("\u00A0", " ").strip() if isinstance(v, str) else v) for k, v in parsed.items()}
+    except Exception:
+        pass
+    return {}
+
+
+# -------------------------
+# Table mappings
+# -------------------------
+main_tables = {
+    "DDM_DOMAIN_VALUE": {
+        "name": "OMNIDDM_TK270.COMMON.DDM_DOMAIN_VALUE",
+        "temp": "OMNIDDM_TK270.COMMON.DDM_DOMAIN_VALUE_TEMP",
+        "log": "OMNIDDM_TK270.COMMON.DDM_DOMAIN_VALUE_LOG",
+        "required_cols": ["TARGETENTITY", "TARGETDOMAIN", "DOMAINVALUE", "DESCRIPTION"],
+        "key_col": ["TARGETENTITY", "TARGETDOMAIN", "DOMAINVALUE"],
+    },
+    "DDM_XREF_DOMAIN_VALUE": {
+        "name": "OMNIDDM_TK270.COMMON.DDM_XREF_DOMAIN_VALUE",
+        "temp": "OMNIDDM_TK270.COMMON.DDM_XREF_DOMAIN_VALUE_TEMP",
+        "log": "OMNIDDM_TK270.COMMON.DDM_XREF_DOMAIN_VALUE_LOG",
+        "required_cols": [
+            "TARGETENTITY",
+            "TARGETDOMAIN",
+            "TARGETDOMAINVALUE",
+            "FROMENTITY",
+            "FROMDOMAIN",
+            "FROMDOMAINVALUE",
+            "DESCRIPTION",
+        ],
+        "key_col": ["TARGETENTITY", "TARGETDOMAIN", "TARGETDOMAINVALUE", "FROMENTITY", "FROMDOMAIN", "FROMDOMAINVALUE"],
+    },
+}
+
+
+def fetch_table_column_types(table_full_name):
+    """Return a mapping UPPERCASE column_name -> DATA_TYPE for the given table."""
+    ensure_session()
+    try:
+        parts = table_full_name.split(".")
+        if len(parts) == 3:
+            db_name, schema_name, tbl_name = parts
+            q = (
+                "SELECT column_name, data_type FROM "
+                f"{db_name}.information_schema.columns "
+                f"WHERE table_name = '{tbl_name}' AND table_schema = '{schema_name}'"
+            )
+            meta = session.sql(q).to_pandas()
+            return {r["COLUMN_NAME"].upper(): str(r["DATA_TYPE"]).upper() for _, r in meta.iterrows()}
+    except Exception:
+        pass
+    return {}
+
+
+def coerce_value_for_column(col, raw_v, col_types):
+    """Coerce raw_v into SQL-ready literal depending on column type; handle time-only strings."""
+    try:
+        if isinstance(raw_v, str):
+            raw_v = normalize_string(raw_v)
+        try:
+            if pd.isna(raw_v):
+                raw_v = None
+        except Exception:
+            pass
+
+        dtype = col_types.get(col.upper(), "")
+
+        if dtype and ("TIMESTAMP" in dtype or "DATE" in dtype or "TIME" in dtype):
+            if raw_v is None or raw_v == "":
+                return "NULL"
+            dt = pd.to_datetime(raw_v, errors="coerce", dayfirst=False)
+            if pd.isna(dt):
+                time_only_pattern = r"^\s*\d{1,2}:\d{2}(?::\d{2}(?:\.\d+)?)?\s*$"
+                if isinstance(raw_v, str) and re.match(time_only_pattern, raw_v):
+                    today_str = datetime.now().strftime("%Y-%m-%d")
+                    candidate = f"{today_str} {raw_v}"
+                    dt = pd.to_datetime(candidate, errors="coerce", dayfirst=False)
+            if pd.isna(dt):
+                return "NULL"
+            val_str = dt.strftime("%Y-%m-%d %H:%M:%S")
+            return sql_literal(val_str)
+
+        if dtype and any(x in dtype for x in ("NUMBER", "INT", "DECIMAL", "NUMERIC", "FLOAT", "DOUBLE")):
+            if raw_v is None or raw_v == "":
+                return "NULL"
+            try:
+                num = float(raw_v)
+                return str(int(num)) if num.is_integer() else str(num)
+            except Exception:
+                return "NULL"
+
+        if raw_v is None or raw_v == "":
+            return "NULL"
+        return sql_literal(raw_v)
+    except Exception:
+        return "NULL"
+
+
+def get_row_key(row, key_cols):
+    """
+    Return stable key for a row (tuple for composite keys, string for single).
+    NORMALIZATION: remove NBSP, collapse spaces, UPPERCASE so keys match robustly.
+    """
+    def norm_value(v):
+        if v is None:
+            return ""
+        if isinstance(v, str):
+            v2 = normalize_string(v)
+            if v2 is None:
+                return ""
+            return v2.upper()
+        try:
+            if pd.isna(v):
+                return ""
+        except Exception:
+            pass
+        return str(v).upper()
+
+    if isinstance(key_cols, (list, tuple)):
+        parts = []
+        for k in key_cols:
+            v = None
+            # try case-sensitive access first
+            try:
+                v = row.get(k)
+            except Exception:
+                v = None
+            if v is None and hasattr(row, "index"):
+                # fallback case-insensitive
+                for colname in row.index:
+                    try:
+                        if str(colname).lower() == str(k).lower():
+                            v = row[colname]
+                            break
+                    except Exception:
+                        continue
+            parts.append(norm_value(v))
+        return tuple(parts)
+    else:
+        k = key_cols
+        v = None
+        try:
+            v = row.get(k)
+        except Exception:
+            v = None
+        if v is None and hasattr(row, "index"):
+            for colname in row.index:
+                try:
+                    if str(colname).lower() == str(k).lower():
+                        v = row[colname]
+                        break
+                except Exception:
+                    continue
+        return norm_value(v)
+
+
+def get_series_value(series_row, col):
+    """Robustly get a value from a pandas Series row (case-insensitive fallback)."""
+    v = None
+    try:
+        v = series_row.get(col)
+    except Exception:
+        v = None
+    if v is None and hasattr(series_row, "index"):
+        for colname in series_row.index:
+            try:
+                if str(colname).lower() == str(col).lower():
+                    v = series_row[colname]
+                    break
+            except Exception:
+                continue
+    if isinstance(v, str):
+        v = normalize_string(v)
+    else:
+        try:
+            if pd.isna(v):
+                v = None
+        except Exception:
+            pass
+    return v
+
+
+def build_where_from_key_inputs(key_cols, inputs_map):
+    """
+    Build WHERE clause from key inputs map.
+    - Normalizes input strings (strip NBSP, collapse spaces).
+    - Uses case-insensitive comparison: UPPER(col) = UPPER('value')
+    - For missing inputs returns None (caller should validate and show error)
+    """
+    def norm_for_sql(v):
+        if v is None:
+            return None
+        if isinstance(v, str):
+            s = v.replace("\u00A0", " ")
+            s = re.sub(r"\s+", " ", s).strip()
+            if s == "":
+                return None
+            return s
+        try:
+            if pd.isna(v):
+                return None
+        except Exception:
+            pass
+        return str(v)
+
+    parts = []
+    if isinstance(key_cols, (list, tuple)):
+        for kc in key_cols:
+            raw = inputs_map.get(kc, None)
+            v = norm_for_sql(raw)
+            if v is None:
+                # if any key part is missing, return None so caller can require full key
+                return None
+            esc = str(v).replace("'", "''")
+            parts.append(f"UPPER({kc}) = UPPER('{esc}')")
+    else:
+        v = norm_for_sql(inputs_map.get(key_cols, None))
+        if v is None:
+            return None
+        esc = str(v).replace("'", "''")
+        parts.append(f"UPPER({key_cols}) = UPPER('{esc}')")
+
+    return " AND ".join(parts) if parts else None
+
+
+def build_where_from_dict(d):
+    """Build a WHERE clause from a dict of col->value; handles None as IS NULL."""
+    if not d or not isinstance(d, dict):
+        return None
+    parts = []
+    for k, v in d.items():
+        col = str(k).upper()
+        if v is None or (isinstance(v, str) and v.strip() == ""):
+            parts.append(f"{col} IS NULL")
+        else:
+            parts.append(f"{col} = {sql_literal(v)}")
+    return " AND ".join(parts) if parts else None
+
+
+# New: more robust lookup for log table (handles full-name, short name, mapping-key)
+def find_log_table_for_main(main_table_name_or_key):
+    # try exact full name match
+    for key, info in main_tables.items():
+        if info.get("name") == main_table_name_or_key:
+            return info.get("log")
+    # try matching by just the last identifier (table name)
+    try:
+        # extract tail if name looks like DB.SCHEMA.TABLENAME
+        tail = str(main_table_name_or_key).split(".")[-1]
+        for key, info in main_tables.items():
+            if info.get("name") and info.get("name").split(".")[-1].upper() == tail.upper():
+                return info.get("log")
+    except Exception:
+        pass
+    # try if user passed mapping key
+    try:
+        if str(main_table_name_or_key) in main_tables:
+            return main_tables[str(main_table_name_or_key)].get("log")
+    except Exception:
+        pass
+    return None
+
+
+def log_change(main_table_name_or_key, action, old_value=None, new_value=None):
+    """Write a log row into the mapped log table. Accepts mapping key or full table name."""
+    ensure_session()
+    log_table = find_log_table_for_main(main_table_name_or_key)
+    if not log_table:
+        # helpful debug message
+        st.error(f"Could not determine log table for main table/key: {main_table_name_or_key}")
+        raise ValueError(f"No log table mapping for main table/key {main_table_name_or_key}")
+
+    # Defensive deep copy so later mutations don't affect what's logged
+    try:
+        import copy
+        old_copy = copy.deepcopy(old_value)
+        new_copy = copy.deepcopy(new_value)
+    except Exception:
+        old_copy = old_value
+        new_copy = new_value
+
+    cleaned_old = clean_for_json(old_copy) if old_copy is not None else None
+    cleaned_new = clean_for_json(new_copy) if new_copy is not None else None
+
+    # Ensure we serialize here and freeze the JSON string
+    old_json = json.dumps(cleaned_old) if cleaned_old is not None else None
+    new_json = json.dumps(cleaned_new) if cleaned_new is not None else None
+
+    old_sql_val = "$$ " + old_json + " $$" if old_json is not None else "NULL"
+    new_sql_val = "$$ " + new_json + " $$" if new_json is not None else "NULL"
+
+    insert_sql = (
+        "INSERT INTO " + log_table + " "
+        "(action, table_name, old_value, new_value, changed_by, changed_at, approved) VALUES ("
+        + "'" + str(action) + "', "
+        + "'" + str(main_table_name_or_key) + "', "
+        + old_sql_val + ", " + new_sql_val + ", "
+        + "'streamlit_user', CURRENT_TIMESTAMP, FALSE)"
+    )
+    try:
+        session.sql(insert_sql).collect()
+        # debug confirmation visible in UI to ensure XREF logging is observable
+        st.info(f"Logged change to {log_table} for table {main_table_name_or_key} (action={action})")
+    except Exception as e:
+        st.error("Failed to write to log table: " + str(e))
+        # raise so caller can decide what to do (we prefer to fail loudly)
+        raise
+
+
+# function defined before render_table_ui to avoid runtime errors
+def fetch_main_table_sorted(table_name):
+    ensure_session()
+    try:
+        df = session.table(table_name).to_pandas()
+    except Exception:
+        return pd.DataFrame()
+    ts_candidates = [c for c in df.columns if c.lower() in ("approved_at", "changed_at", "created_at", "updated_at", "load_ts")]
+    if ts_candidates:
+        ts_col = ts_candidates[0]
+        try:
+            df[ts_col] = pd.to_datetime(df[ts_col], errors="coerce")
+            df = df.sort_values(by=ts_col, ascending=False).reset_index(drop=True)
+            return df
+        except Exception:
+            pass
+    return df.reset_index(drop=True)
+
+
+# -------------------------
+# Main per-table UI renderer
+# -------------------------
+def render_table_ui(tab, table_key):
+    ensure_session()
+
+    info = main_tables[table_key]
+    main_table = info["name"]
+    temp_table = info["temp"]
+    log_table = info["log"]
+    required_cols = info["required_cols"]
+    key_cols = info.get("key_col", required_cols[-1])
+
+    with tab:
+        # Approval Dashboard
+        st.markdown("## Approval Dashboard")
+        try:
+            logs_df = session.sql(f"SELECT * FROM {log_table} WHERE approved = FALSE").to_pandas()
+        except Exception as e:
+            st.error("Could not fetch pending logs: " + str(e))
+            logs_df = pd.DataFrame()
+
+        pending_count = len(logs_df)
+        st.markdown(f"### Pending Logs for {table_key} ({pending_count})")
+
+        if logs_df.empty:
+            st.success("No pending approvals.")
+        else:
+            logs_df.columns = [c.lower() for c in logs_df.columns]
+            display_cols = [c for c in logs_df.columns if c not in ["approved", "approved_by", "approved_at"]]
+            display_df = logs_df[display_cols].copy().reset_index(drop=True)
+
+            approve_key = f"approve_col_{table_key}"
+            if approve_key not in st.session_state or len(st.session_state[approve_key]) != len(display_df):
+                st.session_state[approve_key] = [False] * len(display_df)
+
+            if st.button("Select All Pending for Approval", key=f"select_all_{table_key}"):
+                st.session_state[approve_key] = [True] * len(display_df)
+
+            display_df["approve"] = st.session_state[approve_key]
+
+            column_config = {col: st.column_config.Column(disabled=True) for col in display_df.columns if col != "approve"}
+            column_config["approve"] = st.column_config.CheckboxColumn("Approve", help="Tick to approve this record", width=80)
+
+            edited_logs = st.data_editor(
+                display_df,
+                use_container_width=True,
+                height=300,
+                column_config=column_config,
+                hide_index=True,
+                key=f"data_editor_logs_{table_key}"
+            )
+
+            if "approve" in edited_logs.columns:
+                st.session_state[approve_key] = list(edited_logs["approve"])
+
+            # Approve Selected Records handler
+            if st.button(f"Approve Selected Records for {table_key}"):
+                ensure_session()
+                try:
+                    logs_db = session.sql(f"SELECT * FROM {log_table} WHERE approved = FALSE").to_pandas()
+                except Exception as e:
+                    st.error("Could not fetch logs for approval: " + str(e))
+                    logs_db = pd.DataFrame()
+
+                if logs_db.empty:
+                    st.info("No pending logs at approval time.")
+                else:
+                    logs_db.columns = [c.lower() for c in logs_db.columns]
+
+                    def db_row_key(r):
+                        t = r.get("table_name") if r.get("table_name") is not None else ""
+                        a = r.get("action") if r.get("action") is not None else ""
+                        cb = r.get("changed_by") if r.get("changed_by") is not None else ""
+                        ch = r.get("changed_at")
+                        try:
+                            ch_iso = ch.isoformat() if hasattr(ch, "isoformat") else str(ch)
+                        except Exception:
+                            ch_iso = str(ch)
+                        return (str(t), str(a), str(cb), str(ch_iso))
+
+                    db_key_map = {}
+                    for _, r in logs_db.iterrows():
+                        key = db_row_key(r)
+                        db_key_map.setdefault(key, []).append(r)
+
+                    to_approve = edited_logs[edited_logs["approve"] == True]
+                    if to_approve.empty:
+                        st.warning("No rows selected for approval.")
+                    else:
+                        processed = 0
+                        errors = []
+
+                        for _, picked in to_approve.iterrows():
+                            table_name = picked.get("table_name")
+                            action = picked.get("action")
+                            changed_by = picked.get("changed_by")
+                            changed_at = picked.get("changed_at")
+                            try:
+                                changed_at_iso = changed_at.isoformat() if hasattr(changed_at, "isoformat") else str(changed_at)
+                            except Exception:
+                                changed_at_iso = str(changed_at)
+                            lookup_key = (str(table_name), str(action), str(changed_by), str(changed_at_iso))
+
+                            matched = db_key_map.get(lookup_key)
+                            if not matched:
+                                msg = "No matching DB log found for selected row: " + str(lookup_key)
+                                errors.append(msg)
+                                st.warning(msg)
+                                continue
+
+                            db_row = matched.pop(0)
+                            log_id = db_row.get("log_id")
+                            new_value_db = db_row.get("new_value")
+                            old_value_db = db_row.get("old_value")
+                            table_name_db = db_row.get("table_name")
+                            action_db = db_row.get("action")
+
+                            # find mapping
+                            main_info = None
+                            for k, inf in main_tables.items():
+                                if inf.get("name") == table_name_db:
+                                    main_info = inf
+                                    break
+                            if not main_info:
+                                msg = f"No main mapping found for {table_name_db} (log_id={log_id})"
+                                errors.append(msg)
+                                st.error(msg)
+                                continue
+
+                            main_table_name = main_info.get("name")
+                            required_cols_local = main_info.get("required_cols")
+                            main_col_types = fetch_table_column_types(main_table_name)
+
+                            parsed_new = parse_new_value(new_value_db) if new_value_db is not None else {}
+                            parsed_old = parse_new_value(old_value_db) if old_value_db is not None else {}
+                            act = str(action_db).upper() if action_db is not None else "INSERT"
+
+                            try:
+                                # Apply to main table according to action
+                                if act == "INSERT":
+                                    cols_from_new = list(parsed_new.keys()) if isinstance(parsed_new, dict) and parsed_new else required_cols_local
+                                    vals_parts = []
+                                    for col in cols_from_new:
+                                        raw = parsed_new.get(col) if isinstance(parsed_new, dict) else None
+                                        if raw is None and isinstance(parsed_new, dict):
+                                            raw = parsed_new.get(col.lower(), parsed_new.get(col.upper(), None))
+                                        vals_parts.append(coerce_value_for_column(col, raw, main_col_types))
+                                    insert_sql = "INSERT INTO " + main_table_name + " (" + ", ".join(cols_from_new) + ") VALUES (" + ", ".join(vals_parts) + ")"
+                                    session.sql(insert_sql).collect()
+                                    processed += 1
+
+                                    # clear temp row for this new value
+                                    try:
+                                        temp_where = build_where_from_dict(parsed_new)
+                                        if temp_where:
+                                            session.sql("DELETE FROM " + temp_table + " WHERE " + temp_where).collect()
+                                    except Exception as e:
+                                        errors.append(f"Could not clear TEMP for log_id={log_id}: {e}")
+
+                                elif act == "UPDATE":
+                                    set_clause = None
+                                    where_clause = None
+                                    if not isinstance(parsed_old, dict) or not parsed_old:
+                                        # Try quick DB lookup by matching parsed_new's key columns if possible
+                                        # but prefer to warn: the log had no usable old_value
+                                        st.warning(f"Warning: parsed_old empty for log_id={log_id}. Cannot build WHERE from old_value.")
+                                        # for debugging: show content of original DB log fields
+                                        st.info(f"Log row: log_id={log_id}, new_value={new_value_db}, old_value={old_value_db}")
+                                    if isinstance(parsed_new, dict):
+                                        set_parts = []
+                                        for kcol, vcol in parsed_new.items():
+                                            set_parts.append(f"{kcol.upper()} = {coerce_value_for_column(kcol, vcol, main_col_types)}")
+                                        set_clause = ", ".join(set_parts) if set_parts else None
+                                    if isinstance(parsed_old, dict):
+                                        where_parts = []
+                                        for kcol, vcol in parsed_old.items():
+                                            if vcol is None:
+                                                where_parts.append(f"{kcol.upper()} IS NULL")
+                                            else:
+                                                where_parts.append(f"{kcol.upper()} = {coerce_value_for_column(kcol, vcol, main_col_types)}")
+                                        where_clause = " AND ".join(where_parts) if where_parts else None
+                                    if not where_clause and isinstance(parsed_new, dict):
+                                        try_where_parts = []
+                                        for kcol in main_info.get("key_col", [] if not isinstance(main_info.get("key_col"), list) else main_info.get("key_col")):
+                                            vcol = parsed_new.get(kcol) or parsed_new.get(kcol.lower()) or parsed_new.get(kcol.upper())
+                                            if vcol is None:
+                                                try_where_parts.append(f"{kcol.upper()} IS NULL")
+                                            else:
+                                                try_where_parts.append(f"{kcol.upper()} = {coerce_value_for_column(kcol, vcol, main_col_types)}")
+                                        try_where = " AND ".join(try_where_parts) if try_where_parts else None
+                                        if try_where:
+                                            where_clause = try_where
+
+                                    if set_clause and where_clause:
+                                        update_sql = "UPDATE " + main_table_name + " SET " + set_clause + " WHERE " + where_clause
+                                        session.sql(update_sql).collect()
+                                        processed += 1
+
+                                        # clear temp row for this new value
+                                        try:
+                                            temp_where = build_where_from_dict(parsed_new)
+                                            if temp_where:
+                                                session.sql("DELETE FROM " + temp_table + " WHERE " + temp_where).collect()
+                                        except Exception as e:
+                                            errors.append(f"Could not clear TEMP for log_id={log_id}: {e}")
+
+                                    else:
+                                        # fallback: insert new if where clause insufficient
+                                        cols_from_new = list(parsed_new.keys()) if isinstance(parsed_new, dict) and parsed_new else required_cols_local
+                                        vals_parts = []
+                                        for col in cols_from_new:
+                                            raw = parsed_new.get(col) if isinstance(parsed_new, dict) else None
+                                            if raw is None and isinstance(parsed_new, dict):
+                                                raw = parsed_new.get(col.lower(), parsed_new.get(col.upper(), None))
+                                            vals_parts.append(coerce_value_for_column(col, raw, main_col_types))
+                                        insert_sql = "INSERT INTO " + main_table_name + " (" + ", ".join(cols_from_new) + ") VALUES (" + ", ".join(vals_parts) + ")"
+                                        session.sql(insert_sql).collect()
+                                        processed += 1
+
+                                        try:
+                                            temp_where = build_where_from_dict(parsed_new)
+                                            if temp_where:
+                                                session.sql("DELETE FROM " + temp_table + " WHERE " + temp_where).collect()
+                                        except Exception as e:
+                                            errors.append(f"Could not clear TEMP for log_id={log_id}: {e}")
+
+                                elif act == "DELETE":
+                                    where_clause = None
+                                    if isinstance(parsed_old, dict):
+                                        where_parts = []
+                                        for kcol, vcol in parsed_old.items():
+                                            if vcol is None:
+                                                where_parts.append(f"{kcol.upper()} IS NULL")
+                                            else:
+                                                where_parts.append(f"{kcol.upper()} = {coerce_value_for_column(kcol, vcol, main_col_types)}")
+                                        where_clause = " AND ".join(where_parts) if where_parts else None
+                                    if where_clause:
+                                        delete_sql = "DELETE FROM " + main_table_name + " WHERE " + where_clause
+                                        session.sql(delete_sql).collect()
+                                        processed += 1
+
+                                        # clear temp row for this delete
+                                        try:
+                                            temp_where = build_where_from_dict(parsed_old)
+                                            if temp_where:
+                                                session.sql("DELETE FROM " + temp_table + " WHERE " + temp_where).collect()
+                                        except Exception as e:
+                                            errors.append(f"Could not clear TEMP for log_id={log_id}: {e}")
+                                    else:
+                                        # fallback: try parsed_new as way to locate row for delete
+                                        if isinstance(parsed_new, dict):
+                                            where_parts = []
+                                            for kcol, vcol in parsed_new.items():
+                                                if vcol is None:
+                                                    where_parts.append(f"{kcol.upper()} IS NULL")
+                                                else:
+                                                    where_parts.append(f"{kcol.upper()} = {coerce_value_for_column(kcol, vcol, main_col_types)}")
+                                            where_clause2 = " AND ".join(where_parts) if where_parts else None
+                                            if where_clause2:
+                                                session.sql("DELETE FROM " + main_table_name + " WHERE " + where_clause2).collect()
+                                                processed += 1
+                                                try:
+                                                    temp_where = build_where_from_dict(parsed_new)
+                                                    if temp_where:
+                                                        session.sql("DELETE FROM " + temp_table + " WHERE " + temp_where).collect()
+                                                except Exception as e:
+                                                    errors.append(f"Could not clear TEMP for log_id={log_id}: {e}")
+                                            else:
+                                                msg = f"Cannot determine WHERE clause for DELETE for log_id={log_id}; skipped."
+                                                errors.append(msg)
+                                                st.warning(msg)
+                                        else:
+                                            msg = f"Cannot determine WHERE clause for DELETE for log_id={log_id}; skipped."
+                                            errors.append(msg)
+                                            st.warning(msg)
+                                else:
+                                    # default behavior - insert
+                                    cols_from_new = list(parsed_new.keys()) if isinstance(parsed_new, dict) and parsed_new else required_cols_local
+                                    vals_parts = []
+                                    for col in cols_from_new:
+                                        raw = parsed_new.get(col) if isinstance(parsed_new, dict) else None
+                                        if raw is None and isinstance(parsed_new, dict):
+                                            raw = parsed_new.get(col.lower(), parsed_new.get(col.upper(), None))
+                                        vals_parts.append(coerce_value_for_column(col, raw, main_col_types))
+                                    insert_sql = "INSERT INTO " + main_table_name + " (" + ", ".join(cols_from_new) + ") VALUES (" + ", ".join(vals_parts) + ")"
+                                    session.sql(insert_sql).collect()
+                                    processed += 1
+                                    try:
+                                        temp_where = build_where_from_dict(parsed_new)
+                                        if temp_where:
+                                            session.sql("DELETE FROM " + temp_table + " WHERE " + temp_where).collect()
+                                    except Exception as e:
+                                        errors.append(f"Could not clear TEMP for log_id={log_id}: {e}")
+
+                                # mark log approved
+                                try:
+                                    if log_id is not None:
+                                        try:
+                                            lid = int(log_id)
+                                            session.sql("UPDATE " + log_table + " SET approved = TRUE, approved_by = 'business_user', approved_at = CURRENT_TIMESTAMP WHERE log_id = " + str(lid) + " AND approved = FALSE").collect()
+                                        except Exception:
+                                            table_name_esc = str(table_name_db).replace("'", "''")
+                                            changed_at_str = str(db_row.get("changed_at")).replace("'", "''")
+                                            session.sql("UPDATE " + log_table + " SET approved = TRUE, approved_by = 'business_user', approved_at = CURRENT_TIMESTAMP WHERE table_name = '" + table_name_esc + "' AND changed_at = '" + changed_at_str + "'").collect()
+                                    else:
+                                        table_name_esc = str(table_name_db).replace("'", "''")
+                                        changed_at_str = str(db_row.get("changed_at")).replace("'", "''")
+                                        session.sql("UPDATE " + log_table + " SET approved = TRUE, approved_by = 'business_user', approved_at = CURRENT_TIMESTAMP WHERE table_name = '" + table_name_esc + "' AND changed_at = '" + changed_at_str + "'").collect()
+                                except Exception as e:
+                                    errors.append("Could not mark log approved for log_id=" + str(log_id) + ": " + str(e))
+
+                            except Exception as e:
+                                errors.append("Error processing log_id=" + str(log_id) + ": " + str(e))
+                                st.error("Error processing log_id=" + str(log_id) + ": " + str(e))
+                                continue
+
+                        st.success("Approval run complete. Processed " + str(processed) + " item(s).")
+                        if errors:
+                            st.warning("Some items had issues; check messages above.")
+
+                        try:
+                            if hasattr(st, "experimental_rerun"):
+                                st.experimental_rerun()
+                            elif hasattr(st, "rerun"):
+                                st.rerun()
+                            else:
+                                import streamlit.components.v1 as components
+                                components.html("<script>window.location.reload()</script>", height=0)
+                        except Exception:
+                            import streamlit.components.v1 as components
+                            components.html("<script>window.location.reload()</script>", height=0)
+
+        st.markdown("---")
+        # Main Table display + edit toggle
+        st.subheader("Main Table: " + main_table)
+        main_df = fetch_main_table_sorted(main_table)
+
+        if main_df is None or main_df.empty:
+            st.info("Main table empty or could not be fetched.")
+        else:
+            st.markdown("**Tip:** Click 'Enable Editing' to toggle edit mode. When edit mode is ON, you can edit cells. Click 'Send Edits to Approval' to send changed rows to TEMP & log them.")
+
+            edit_key = f"main_edit_enabled_{table_key}"
+            if edit_key not in st.session_state:
+                st.session_state[edit_key] = False
+
+            toggle_label = "Disable Editing" if st.session_state[edit_key] else "Enable Editing"
+            if st.button(toggle_label, key=f"btn_edit_{table_key}"):
+                st.session_state[edit_key] = not st.session_state[edit_key]
+
+            if st.session_state[edit_key]:
+                st.success("Edit mode enabled — edit cells and then click 'Send Edits to Approval'.")
+            else:
+                st.info("Edit mode disabled — table is read-only.")
+
+            # ------------------------
+            # Prepare display_df and editor
+            # ------------------------
+            display_df = main_df.copy().reset_index(drop=True)
+
+            # Remove duplicate columns if any (keep first occurrence)
+            display_df = display_df.loc[:, ~display_df.columns.duplicated()]
+
+            # Column config: editable depends on edit mode
+            column_config = {}
+            for c in display_df.columns:
+                column_config[c] = st.column_config.Column(disabled=not bool(st.session_state[edit_key]))
+
+            # Render editor (AG-Grid preferred)
+            if AGGRID_AVAILABLE:
+                gb = GridOptionsBuilder.from_dataframe(display_df)
+                gb.configure_default_column(editable=bool(st.session_state[edit_key]), resizable=True, filter=True, sortable=True)
+                grid_opts = gb.build()
+                grid_resp = AgGrid(
+                    display_df,
+                    gridOptions=grid_opts,
+                    data_return_mode=DataReturnMode.FILTERED_AND_SORTED,
+                    update_mode=GridUpdateMode.MANUAL if st.session_state[edit_key] else GridUpdateMode.NO_UPDATE,
+                    fit_columns_on_grid_load=True,
+                    enable_enterprise_modules=False,
+                    allow_unsafe_jscode=False,
+                    theme="alpine",
+                    key=f"aggrid_main_{table_key}",
+                )
+                edited_data = pd.DataFrame(grid_resp["data"])
+            else:
+                edited_data = st.data_editor(
+                    display_df,
+                    use_container_width=True,
+                    num_rows="dynamic",
+                    column_config=column_config,
+                    key=f"data_editor_main_{table_key}",
+                )
+
+            if edited_data is not None and not edited_data.empty:
+                edited_data = edited_data.loc[:, ~edited_data.columns.duplicated()]
+
+            # --- Send Edits to Approval (detect diffs and send only changed rows) ---
+            if st.button("Send Edits to Approval", key=f"send_edits_{table_key}"):
+                try:
+                    ensure_session()
+                    orig = main_df.copy().reset_index(drop=True)
+                    new = edited_data.copy().reset_index(drop=True)
+
+                    # Normalize key columns in both orig and new before building indices so keys match robustly
+                    def normalize_key_columns_in_df(df, key_cols_local):
+                        df2 = df.copy()
+                        if isinstance(key_cols_local, (list, tuple)):
+                            for kc in key_cols_local:
+                                if kc in df2.columns:
+                                    df2[kc] = df2[kc].apply(lambda x: normalize_string(x) if isinstance(x, str) else x)
+                        else:
+                            if key_cols_local in df2.columns:
+                                df2[key_cols_local] = df2[key_cols_local].apply(lambda x: normalize_string(x) if isinstance(x, str) else x)
+                        return df2
+
+                    orig_norm = normalize_key_columns_in_df(orig, key_cols)
+                    new_norm = normalize_key_columns_in_df(new, key_cols)
+
+                    # build index maps keyed by stable key
+                    orig_index = {}
+                    new_index = {}
+                    orig_keys = []
+
+                    if not orig_norm.empty:
+                        # Build orig_index and list of orig_keys (ordered by row position)
+                        for _, r in orig_norm.iterrows():
+                            k = get_row_key(r, key_cols)
+                            orig_index[k] = r
+                            orig_keys.append(k)
+
+                    if not new_norm.empty:
+                        # Build new_index but retain mapping to the original key by row position.
+                        # This helps when key columns were edited (so new key != old key).
+                        # We'll use row position to find the corresponding original key if available.
+                        new_rows = list(new_norm.iterrows())
+                        for idx, (_i, r) in enumerate(new_rows):
+                            # prefer the original key at same row index (if present)
+                            if idx < len(orig_keys):
+                                orig_key_for_this_row = orig_keys[idx]
+                            else:
+                                # fallback: compute key from the new row
+                                orig_key_for_this_row = get_row_key(r, key_cols)
+                            # store mapping using a special composite key: orig_key_for_this_row
+                            new_index[orig_key_for_this_row] = r
+
+
+                    processed = 0
+                    errors = []
+
+                    def insert_row_into_temp_from_series(series_row):
+                        cols_sql = ", ".join(required_cols)
+                        vals = []
+                        for c in required_cols:
+                            v = get_series_value(series_row, c)
+                            if v is None or v == "":
+                                vals.append("NULL")
+                            else:
+                                sval = str(v).replace("'", "''")
+                                vals.append("'" + normalize_string(sval) + "'")
+                        vals_sql = ", ".join(vals)
+                        session.sql("INSERT INTO " + temp_table + " (" + cols_sql + ") VALUES (" + vals_sql + ")").collect()
+
+                    # iterate over new rows and compare to orig, send changed rows
+                    for orig_key, new_row in new_index.items():
+                        try:
+                            # old_row is retrieved by the original key we stored earlier (position-based)
+                            old_row = orig_index.get(orig_key)
+                            if old_row is None:
+                                changed = True
+                            else:
+                                changed = False
+                                for c in required_cols:
+                                    o_val = get_series_value(old_row, c)
+                                    n_val = get_series_value(new_row, c)
+                                    if isinstance(o_val, str):
+                                        o_cmp = normalize_string(o_val)
+                                    else:
+                                        o_cmp = o_val
+                                    if isinstance(n_val, str):
+                                        n_cmp = normalize_string(n_val)
+                                    else:
+                                        n_cmp = n_val
+                                    if o_cmp != n_cmp:
+                                        changed = True
+                                        break
+                            if not changed:
+                                continue
+
+                            # DB-first authoritative old_dict fetch
+                            old_dict = {}
+                            if old_row is not None:
+                                for c in required_cols:
+                                    v = get_series_value(old_row, c)
+                                    old_dict[c] = normalize_string(v) if isinstance(v, str) else v
+                            else:
+                                for c in required_cols:
+                                    old_dict[c] = None
+
+                            new_dict = {}
+                            for c in required_cols:
+                                v = get_series_value(new_row, c)
+                                new_dict[c] = normalize_string(v) if isinstance(v, str) else v
+                            cleaned_new_json = json.dumps(clean_for_json(new_dict))
+
+                            # Check duplicate pending log guard
+                            try:
+                                table_name_esc = str(main_table).replace("'", "''")
+                                check_sql = (
+                                    "SELECT COUNT(1) AS CNT FROM " + log_table +
+                                    " WHERE table_name = '" + table_name_esc + "'" +
+                                    " AND approved = FALSE" +
+                                    " AND new_value = $$ " + cleaned_new_json + " $$"
+                                )
+                                cnt_df = session.sql(check_sql).to_pandas()
+                                existing_cnt = int(cnt_df.iloc[0, 0]) if not cnt_df.empty else 0
+                            except Exception:
+                                existing_cnt = 0
+
+                            if existing_cnt > 0:
+                                errors.append(f"Skipped duplicate pending log for key={orig_key}")
+                                continue
+
+                            # Insert changed row into TEMP and log as UPDATE
+                            try:
+                                insert_row_into_temp_from_series(new_row)
+                            except Exception as e:
+                                errors.append(f"Failed to insert into TEMP for key={orig_key}: {e}")
+                                continue
+
+                            # call log_change with mapping key (table_key) so find_log_table_for_main is robust
+                            try:
+                                log_change(table_key, "UPDATE", old_dict, new_dict)
+                            except Exception as e:
+                                # if logging fails, surface warning but keep flow (you may want to rollback TEMP insert manually)
+                                errors.append(f"Logging failed for key={orig_key}: {e}")
+                                st.warning(f"Logging failed for key={orig_key}: {e}")
+
+                            processed += 1
+
+                        except Exception as e:
+                            errors.append(f"Processing key={orig_key} failed: {e}")
+
+                    st.success(f"Sent changed rows to TEMP and logged for approval. Processed: {processed}")
+                    if errors:
+                        for er in errors:
+                            st.warning(er)
+
+                    # refresh UI
+                    try:
+                        if hasattr(st, "experimental_rerun"):
+                            st.experimental_rerun()
+                        elif hasattr(st, "rerun"):
+                            st.rerun()
+                        else:
+                            import streamlit.components.v1 as components
+                            components.html("<script>window.location.reload()</script>", height=0)
+                    except Exception:
+                        pass
+
+                except Exception as e:
+                    st.error("Error processing edits for approval: " + str(e))
+
+        # Upload / Manual Insert / Temp CRUD
+        st.markdown("---")
+        st.markdown("### Upload Excel or CSV (Inserts into TEMP Table)")
+        uploaded_file = st.file_uploader(f"Upload for {table_key}", type=["xlsx", "csv"], key=f"uploader_{table_key}")
+        if uploaded_file:
+            ensure_session()
+            excel_df = read_uploaded_file(uploaded_file)
+            if excel_df is not None:
+                excel_df.columns = [col.strip().upper() for col in excel_df.columns]
+                st.dataframe(excel_df.head())
+
+                # get temp table column types
+                table_col_types = {}
+                try:
+                    parts = temp_table.split(".")
+                    if len(parts) == 3:
+                        db_name, schema_name, tbl_name = parts
+                        meta_q = (
+                            "SELECT column_name, data_type FROM "
+                            f"{db_name}.information_schema.columns WHERE table_name = '{tbl_name}' AND table_schema = '{schema_name}'"
+                        )
+                        meta_df = session.sql(meta_q).to_pandas()
+                        table_col_types = {r["COLUMN_NAME"].upper(): str(r["DATA_TYPE"]).upper() for _, r in meta_df.iterrows()}
+                except Exception:
+                    table_col_types = {}
+
+                cols_in_file = list(excel_df.columns)
+                if table_col_types:
+                    cols_to_insert = [c for c in cols_in_file if c in table_col_types]
+                else:
+                    cols_to_insert = cols_in_file
+
+                if not cols_to_insert:
+                    st.error("No matching columns to insert into TEMP. Check CSV headers vs TEMP table columns.")
+                else:
+                    if st.button(f"Upload to TEMP for {table_key}"):
+                        inserted = 0
+                        for _, row in excel_df.iterrows():
+                            vals = []
+                            for col in cols_to_insert:
+                                raw = row.get(col, "")
+                                if isinstance(raw, str):
+                                    raw = normalize_string(raw)
+                                try:
+                                    if pd.isna(raw):
+                                        raw = None
+                                except Exception:
+                                    pass
+                                dtype = table_col_types.get(col, "")
+                                try:
+                                    if dtype and ("TIMESTAMP" in dtype or "DATE" in dtype or "TIME" in dtype):
+                                        dt = pd.to_datetime(raw, errors="coerce", dayfirst=False)
+                                        if pd.isna(dt):
+                                            vals.append("NULL")
+                                        else:
+                                            vals.append(sql_literal(dt.strftime("%Y-%m-%d %H:%M:%S")))
+                                    elif dtype and any(x in dtype for x in ("NUMBER", "INT", "DECIMAL", "NUMERIC", "FLOAT", "DOUBLE")):
+                                        if raw is None or raw == "":
+                                            vals.append("NULL")
+                                        else:
+                                            try:
+                                                num = float(raw)
+                                                vals.append(str(int(num)) if num.is_integer() else str(num))
+                                            except Exception:
+                                                vals.append("NULL")
+                                    else:
+                                        if raw is None or raw == "":
+                                            vals.append("NULL")
+                                        else:
+                                            vals.append("'" + str(raw).replace("'", "''") + "'")
+                                except Exception:
+                                    vals.append("NULL")
+                            cols_sql = ", ".join(cols_to_insert)
+                            vals_sql = ", ".join(vals)
+                            try:
+                                session.sql("INSERT INTO " + temp_table + " (" + cols_sql + ") VALUES (" + vals_sql + ")").collect()
+                                row_dict = {c: clean_for_json(normalize_string(row.get(c)) if isinstance(row.get(c), str) else row.get(c)) for c in cols_to_insert}
+                                # use table_key so find_log_table_for_main finds correct log table for XREF
+                                try:
+                                    log_change(table_key, "INSERT", None, row_dict)
+                                except Exception as e:
+                                    st.warning(f"Failed to log INSERT for uploaded row: {e}")
+                                inserted += 1
+                            except Exception as e:
+                                st.warning("Insert to TEMP failed for a row: " + str(e))
+                                continue
+                        st.success(str(inserted) + " rows uploaded to TEMP and logged.")
+
+        # Manual Insert into TEMP
+        st.subheader("Manual Insert into TEMP Table")
+        with st.form(f"insert_form_{table_key}"):
+            inputs = {col: st.text_input(col) for col in required_cols}
+            submit = st.form_submit_button("Insert Record")
+            if submit:
+                cols_sql = ", ".join(inputs.keys())
+                cleaned_vals = []
+                for v in inputs.values():
+                    if isinstance(v, str):
+                        v = normalize_string(v)
+                    if v == "" or v is None:
+                        cleaned_vals.append("NULL")
+                    else:
+                        cleaned_vals.append("'" + str(v).replace("'", "''") + "'")
+                vals_sql = ", ".join(cleaned_vals)
+                try:
+                    session.sql("INSERT INTO " + temp_table + " (" + cols_sql + ") VALUES (" + vals_sql + ")").collect()
+                    # use table_key for robust log mapping
+                    try:
+                        log_change(table_key, "INSERT", None, {k: normalize_string(v) if isinstance(v, str) else v for k, v in inputs.items()})
+                    except Exception as e:
+                        st.warning(f"Failed to log manual INSERT: {e}")
+                    st.success("Record inserted into TEMP and logged.")
+                except Exception as e:
+                    st.error("Manual insert failed: " + str(e))
+
+        
+        # Delete in TEMP
+        st.subheader("Delete Record (from TEMP Table)")
+        with st.form(f"delete_form_{table_key}"):
+            del_key_inputs = {}
+            if isinstance(key_cols, (list, tuple)):
+                cols_ui = st.columns(len(key_cols))
+                for i, kc in enumerate(key_cols):
+                    with cols_ui[i]:
+                        del_key_inputs[kc] = st.text_input(kc + " (key value to delete)")
+            else:
+                del_key_inputs[key_cols] = st.text_input(f"{key_cols} to Delete")
+
+            confirm = st.checkbox("Confirm Delete")
+            submit_del = st.form_submit_button("Delete Record")
+            if submit_del:
+                if not confirm:
+                    st.warning("Please confirm delete before proceeding.")
+                else:
+                    # --- 1) Validate all key inputs ---
+                    missing_keys = []
+                    if isinstance(key_cols, (list, tuple)):
+                        for kc in key_cols:
+                            v = del_key_inputs.get(kc)
+                            if v is None or (isinstance(v, str) and v.strip() == ""):
+                                missing_keys.append(kc)
+                    else:
+                        v = del_key_inputs.get(key_cols)
+                        if v is None or (isinstance(v, str) and v.strip() == ""):
+                            missing_keys.append(key_cols)
+
+                    if missing_keys:
+                        st.error("Please provide all key column values before deleting: " + ", ".join(missing_keys))
+                    else:
+                        # Build normalized, case-insensitive WHERE clause
+                        where_clause = build_where_from_key_inputs(key_cols, del_key_inputs)
+
+                        if not where_clause:
+                            st.error("Could not build WHERE clause. Please check key values.")
+                        else:
+                            try:
+                                # ----------------------------------------------------
+                                # --- 2) Try DELETE from TEMP first (Option B step 1)
+                                # ----------------------------------------------------
+                                sel_temp_sql = "SELECT * FROM " + temp_table + " WHERE " + where_clause + " LIMIT 1"
+                                try:
+                                    temp_df = session.sql(sel_temp_sql).to_pandas()
+                                except Exception:
+                                    # Fallback for Snowflake if LIMIT issues
+                                    temp_df = session.sql("SELECT * FROM " + temp_table + " WHERE " + where_clause).to_pandas()
+
+                                if temp_df is not None and not temp_df.empty:
+                                    # Row exists in TEMP → capture old row
+                                    old_row_dict = temp_df.iloc[0].to_dict()
+                                    old_row_norm = {
+                                        str(k): (normalize_string(v) if isinstance(v, str) else v)
+                                        for k, v in old_row_dict.items()
+                                    }
+                                    old_row_clean = clean_for_json(old_row_norm)
+
+                                    # Delete from TEMP
+                                    session.sql("DELETE FROM " + temp_table + " WHERE " + where_clause).collect()
+
+                                    # Log DELETE (use table_key)
+                                    try:
+                                        log_change(table_key, "DELETE", old_row_clean, None)
+                                    except Exception as e:
+                                        st.warning(f"Failed to log DELETE after TEMP delete: {e}")
+
+                                    st.success("Deleted row from TEMP and logged DELETE for approval.")
+
+                                else:
+                                    # ----------------------------------------------------
+                                    # --- 3) Row not in TEMP → fetch from MAIN (Option B)
+                                    # ----------------------------------------------------
+                                    sel_main_sql = "SELECT * FROM " + main_table + " WHERE " + where_clause + " LIMIT 1"
+                                    try:
+                                        main_df_sel = session.sql(sel_main_sql).to_pandas()
+                                    except Exception:
+                                        main_df_sel = session.sql("SELECT * FROM " + main_table + " WHERE " 
+                                        + where_clause).to_pandas()
+
+                                    if main_df_sel is not None and not main_df_sel.empty:
+                                        # --- Found in MAIN → copy to TEMP + log DELETE ---
+                                        main_row = main_df_sel.iloc[0].to_dict()
+                                        main_row_norm = {
+                                            str(k): (normalize_string(v) if isinstance(v, str) else v)
+                                            for k, v in main_row.items()
+                                        }
+                                        old_row_clean = clean_for_json(main_row_norm)
+
+                                        # Build TEMP row values from MAIN row (full copy)
+                                        new_temp_row = {}
+                                        for c in required_cols:
+                                            v = main_row.get(c)
+                                            if isinstance(v, str):
+                                                new_temp_row[c] = normalize_string(v)
+                                            else:
+                                                new_temp_row[c] = v
+
+                                        # Insert the copied MAIN row into TEMP
+                                        cols_sql = ", ".join(required_cols)
+                                        vals_sql_parts = []
+                                        for c in required_cols:
+                                            v = new_temp_row.get(c)
+                                            if v is None or v == "":
+                                                vals_sql_parts.append("NULL")
+                                            else:
+                                                vals_sql_parts.append("'" + str(v).replace("'", "''") + "'")
+                                        vals_sql = ", ".join(vals_sql_parts)
+
+                                        session.sql(
+                                            "INSERT INTO " + temp_table + " (" + cols_sql + ") VALUES (" + vals_sql + ")"
+                                        ).collect()
+
+                                        # Log DELETE (use table_key)
+                                        try:
+                                            log_change(table_key, "DELETE", old_row_clean, None)
+                                        except Exception as e:
+                                            st.warning(f"Failed to log DELETE after copying MAIN to TEMP: {e}")
+
+                                        st.success(
+                                            "Row not found in TEMP. Fetched from MAIN, inserted into TEMP, and logged DELETE for approval."
+                                        )
+
+                                    else:
+                                        # ----------------------------------------------------
+                                        # --- 4) Not in MAIN or TEMP → can't delete
+                                        # ----------------------------------------------------
+                                        st.error(
+                                            "No matching record found in MAIN or TEMP for the provided key values. "
+                                            "Delete request aborted."
+                                        )
+
+                            except Exception as e:
+                                st.error("Delete failed: " + str(e))
+
+# Render tabs
+tab1, tab2 = st.tabs(["DDM_DOMAIN_VALUE", "DDM_XREF_DOMAIN_VALUE"])
+render_table_ui(tab1, "DDM_DOMAIN_VALUE")
+render_table_ui(tab2, "DDM_XREF_DOMAIN_VALUE")
