@@ -557,10 +557,8 @@ def render_table_ui(tab, table_key):
                 if logs_db.empty:
                     st.info("No pending logs at approval time.")
                 else:
-                    # lower-case column names
                     logs_db.columns = [c.lower() for c in logs_db.columns]
 
-                    # show sample which helps debug mismatched table_name content
                     try:
                         sample_names = list(logs_db["table_name"].astype(str).unique())[:5]
                         st.info("Sample pending log.table_name values: " + ", ".join(sample_names))
@@ -618,7 +616,6 @@ def render_table_ui(tab, table_key):
                             # -------- robust main_info lookup: accepts full name, short tail, or mapping key ----------
                             main_info = None
 
-                            # 1) match fully-qualified name
                             try:
                                 for map_key, inf in main_tables.items():
                                     if inf.get("name") and str(inf.get("name")).upper() == str(table_name_db).upper():
@@ -627,7 +624,6 @@ def render_table_ui(tab, table_key):
                             except Exception:
                                 pass
 
-                            # 2) match by short table name (last token after dot)
                             if main_info is None:
                                 try:
                                     tail = str(table_name_db).split(".")[-1].upper()
@@ -641,7 +637,6 @@ def render_table_ui(tab, table_key):
                                 except Exception:
                                     pass
 
-                            # 3) match by mapping key itself (the dict key like "DDM_XREF_DOMAIN_VALUE")
                             if main_info is None:
                                 try:
                                     if str(table_name_db) in main_tables:
@@ -678,7 +673,6 @@ def render_table_ui(tab, table_key):
                                     session.sql(insert_sql).collect()
                                     processed += 1
 
-                                    # clear temp row for this new value
                                     try:
                                         temp_where = build_where_from_dict(parsed_new)
                                         if temp_where:
@@ -722,7 +716,6 @@ def render_table_ui(tab, table_key):
                                         session.sql(update_sql).collect()
                                         processed += 1
 
-                                        # clear temp row for this new value
                                         try:
                                             temp_where = build_where_from_dict(parsed_new)
                                             if temp_where:
@@ -731,7 +724,6 @@ def render_table_ui(tab, table_key):
                                             errors.append(f"Could not clear TEMP for log_id={log_id}: {e}")
 
                                     else:
-                                        # fallback: insert new if where clause insufficient
                                         cols_from_new = list(parsed_new.keys()) if isinstance(parsed_new, dict) and parsed_new else required_cols_local
                                         vals_parts = []
                                         for col in cols_from_new:
@@ -765,7 +757,6 @@ def render_table_ui(tab, table_key):
                                         session.sql(delete_sql).collect()
                                         processed += 1
 
-                                        # clear temp row for this delete
                                         try:
                                             temp_where = build_where_from_dict(parsed_old)
                                             if temp_where:
@@ -773,7 +764,6 @@ def render_table_ui(tab, table_key):
                                         except Exception as e:
                                             errors.append(f"Could not clear TEMP for log_id={log_id}: {e}")
                                     else:
-                                        # fallback: try parsed_new as way to locate row for delete
                                         if isinstance(parsed_new, dict):
                                             where_parts = []
                                             for kcol, vcol in parsed_new.items():
@@ -800,7 +790,6 @@ def render_table_ui(tab, table_key):
                                             errors.append(msg)
                                             st.warning(msg)
                                 else:
-                                    # default behavior - insert
                                     cols_from_new = list(parsed_new.keys()) if isinstance(parsed_new, dict) and parsed_new else required_cols_local
                                     vals_parts = []
                                     for col in cols_from_new:
@@ -917,6 +906,24 @@ def render_table_ui(tab, table_key):
                     column_config=column_config,
                     key=f"data_editor_main_{table_key}",
                 )
+
+            # === NEW: normalize edited_data column names to UPPER and ensure required cols exist ===
+            if edited_data is None:
+                edited_data = pd.DataFrame()
+            else:
+                try:
+                    # normalize column names to uppercase (so required_cols match)
+                    edited_data.columns = [str(c).strip().upper() for c in edited_data.columns]
+                except Exception:
+                    pass
+
+                # ensure required columns exist in edited_data (add empties if missing)
+                for rc in required_cols:
+                    if rc not in edited_data.columns:
+                        edited_data[rc] = None
+
+                # de-duplicate columns if grid duplicated names
+                edited_data = edited_data.loc[:, ~edited_data.columns.duplicated()]
 
             if edited_data is not None and not edited_data.empty:
                 edited_data = edited_data.loc[:, ~edited_data.columns.duplicated()]
@@ -1042,7 +1049,8 @@ def render_table_ui(tab, table_key):
 
                             # Check duplicate pending log guard
                             try:
-                                table_name_esc = str(main_table).replace("'", "''")
+                                # use table_key for consistency with how we log (log_change uses mapping key)
+                                table_name_esc = str(table_key).replace("'", "''")
                                 check_sql = (
                                     "SELECT COUNT(1) AS CNT FROM " + log_table +
                                     " WHERE table_name = '" + table_name_esc + "'" +
