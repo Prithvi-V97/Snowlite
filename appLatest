@@ -26,6 +26,19 @@ try:
 except Exception:
     session = None
 
+st.markdown(
+  """
+  <style>
+  div.stButton > button {
+    white-space: nowrap;
+    width: auto;
+    padding: 0.25rem 0.75rem;
+  }
+  </style>
+  """,
+  unsafe_allow_html=True
+)
+
 # -------------------------
 # Helpers
 # -------------------------
