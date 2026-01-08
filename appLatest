@@ -189,49 +189,51 @@ def find_log_table_for_main(main_table_name):
     return None
 
 def log_change(main_table_name, action, old_value=None, new_value=None):
-    """Write a log row into the mapped log table. More verbose on failure for debugging."""
+    """
+    Write audit rows into the new *_AUDIT tables.
+    This replaces the old JSON-based LOG logic.
+    """
     ensure_session()
     log_table = find_log_table_for_main(main_table_name)
     if not log_table:
-        # raise a clear error (caller can catch); include debug info
-        raise ValueError(f"No log table mapping found for main table identifier: {main_table_name}")
+        raise ValueError(f"No audit table mapping found for {main_table_name}")
 
-    try:
-        import copy
-        old_copy = copy.deepcopy(old_value)
-        new_copy = copy.deepcopy(new_value)
-    except Exception:
-        old_copy = old_value
-        new_copy = new_value
+    user = "streamlit_user"
 
-    cleaned_old = clean_for_json(old_copy) if old_copy is not None else None
-    cleaned_new = clean_for_json(new_copy) if new_copy is not None else None
+    def insert_audit_row(trigger_img, row_dict):
+        if not row_dict:
+            return
 
-    old_json = json.dumps(cleaned_old) if cleaned_old is not None else None
-    new_json = json.dumps(cleaned_new) if cleaned_new is not None else None
+        cols = []
+        vals = []
 
-    old_sql_val = "$$ " + old_json + " $$" if old_json is not None else "NULL"
-    new_sql_val = "$$ " + new_json + " $$" if new_json is not None else "NULL"
+        # Common audit columns
+        cols.extend(["TriggerAction", "TriggerBefAftImg", "TriggerUser"])
+        vals.extend([
+            sql_literal(action),
+            sql_literal(trigger_img),
+            sql_literal(user),
+        ])
 
-    insert_sql = (
-        "INSERT INTO " + log_table + " "
-        "(action, table_name, old_value, new_value, changed_by, changed_at, approved) VALUES ("
-        + "'" + str(action) + "', "
-        + "'" + str(main_table_name) + "', "
-        + old_sql_val + ", " + new_sql_val + ", "
-        + "'streamlit_user', CURRENT_TIMESTAMP, FALSE)"
-    )
-    try:
-        session.sql(insert_sql).collect()
-    except Exception as e:
-        # expose SQL and error for debugging in Streamlit
-        st.error("Failed to write to log table: " + str(e))
-        try:
-            st.text("DEBUG: attempted SQL:\n" + insert_sql)
-        except Exception:
-            pass
-        # re-raise so caller sees the failure (optional: you can comment out raise if you prefer swallow)
-        raise
+        # Business columns (dynamic)
+        for k, v in row_dict.items():
+            cols.append(k)
+            vals.append(sql_literal(v))
+
+        sql = (
+            f"INSERT INTO {log_table} ({', '.join(cols)}) "
+            f"VALUES ({', '.join(vals)})"
+        )
+        session.sql(sql).collect()
+
+    # BEFORE image
+    if old_value:
+        insert_audit_row("BEFORE", old_value)
+
+    # AFTER image
+    if new_value:
+        insert_audit_row("AFTER", new_value)
+
 
 
 # -------------------------
@@ -515,7 +517,14 @@ def render_table_ui(tab, table_key):
                 st.rerun()
         _ = st.session_state[refresh_key]  # refresh dependency trigger
         try:
-            logs_df = session.sql(f"SELECT * FROM {log_table} WHERE approved = FALSE").to_pandas()
+            logs_df = session.sql(
+                f"""
+                SELECT *
+                FROM {log_table}
+                WHERE TriggerBefAftImg = 'AFTER'
+                """
+            ).to_pandas()
+
         except Exception as e:
             st.error("Could not fetch pending logs: " + str(e))
             logs_df = pd.DataFrame()
@@ -961,22 +970,6 @@ def render_table_ui(tab, table_key):
                                     except Exception as e:
                                         errors.append(f"Could not clear TEMP for log_id={log_id}: {e}")
 
-                                # mark log approved
-                                try:
-                                    if log_id is not None:
-                                        try:
-                                            lid = int(log_id)
-                                            session.sql("UPDATE " + log_table + " SET approved = TRUE, approved_by = 'business_user', approved_at = CURRENT_TIMESTAMP WHERE log_id = " + str(lid) + " AND approved = FALSE").collect()
-                                        except Exception:
-                                            table_name_esc = str(table_name_db).replace("'", "''")
-                                            changed_at_str = str(db_row.get("changed_at")).replace("'", "''")
-                                            session.sql("UPDATE " + log_table + " SET approved = TRUE, approved_by = 'business_user', approved_at = CURRENT_TIMESTAMP WHERE table_name = '" + table_name_esc + "' AND changed_at = '" + changed_at_str + "'").collect()
-                                    else:
-                                        table_name_esc = str(table_name_db).replace("'", "''")
-                                        changed_at_str = str(db_row.get("changed_at")).replace("'", "''")
-                                        session.sql("UPDATE " + log_table + " SET approved = TRUE, approved_by = 'business_user', approved_at = CURRENT_TIMESTAMP WHERE table_name = '" + table_name_esc + "' AND changed_at = '" + changed_at_str + "'").collect()
-                                except Exception as e:
-                                    errors.append("Could not mark log approved for log_id=" + str(log_id) + ": " + str(e))
 
                             except Exception as e:
                                 errors.append("Error processing log_id=" + str(log_id) + ": " + str(e))
