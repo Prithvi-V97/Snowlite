@@ -256,14 +256,14 @@ main_tables = {
     "DDM_DOMAIN_VALUE": {
         "name": "OMNIDDM_TK270.COMMON.DDM_DOMAIN_VALUE",
         "temp": "OMNIDDM_TK270.COMMON.DDM_DOMAIN_VALUE_TEMP",
-        "log": "OMNIDDM_TK270.COMMON.DDM_DOMAIN_VALUE_LOG",
+        "log": "OMNIDDM_TK270.COMMON.DDM_DOMAIN_VALUE_AUDIT",
         "required_cols": ["TARGETENTITY", "TARGETDOMAIN", "DOMAINVALUE", "DESCRIPTION"],
         "key_col": ["TARGETENTITY", "TARGETDOMAIN", "DOMAINVALUE"],
     },
     "DDM_XREF_DOMAIN_VALUE": {
         "name": "OMNIDDM_TK270.COMMON.DDM_XREF_DOMAIN_VALUE",
         "temp": "OMNIDDM_TK270.COMMON.DDM_XREF_DOMAIN_VALUE_TEMP",
-        "log": "OMNIDDM_TK270.COMMON.DDM_XREF_DOMAIN_VALUE_LOG",
+        "log": "OMNIDDM_TK270.COMMON.DDM_XREF_DOMAIN_VALUE_AUDIT",
         "required_cols": [
             "TARGETENTITY",
             "TARGETDOMAIN",
@@ -273,9 +273,17 @@ main_tables = {
             "FROMDOMAINVALUE",
             "DESCRIPTION",
         ],
-        "key_col": ["TARGETENTITY", "TARGETDOMAIN", "TARGETDOMAINVALUE", "FROMENTITY", "FROMDOMAIN", "FROMDOMAINVALUE"],
+        "key_col": [
+            "TARGETENTITY",
+            "TARGETDOMAIN",
+            "TARGETDOMAINVALUE",
+            "FROMENTITY",
+            "FROMDOMAIN",
+            "FROMDOMAINVALUE",
+        ],
     },
 }
+
 
 
 def fetch_table_column_types(table_full_name):
