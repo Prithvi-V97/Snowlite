@@ -1,0 +1,260 @@
+Below are **ready-to-run Snowflake scripts** you can use to **trigger the tasks by changing data** and to **verify that the tasks actually ran**.
+You can copy–paste these step by step.
+
+---
+
+# 1️⃣ Pre-checks (run once)
+
+### 1. Check streams exist
+
+```sql
+SHOW STREAMS LIKE 'STR_DDM_XREF_DOMAIN_VALUE';
+```
+
+### 2. Check tasks exist
+
+```sql
+SHOW TASKS LIKE '%XREF_DOMAIN%';
+```
+
+### 3. Make sure tasks are running
+
+```sql
+ALTER TASK TASK_VALIDATE_XREF_DOMAIN_VALUE RESUME;
+ALTER TASK TASK_AUDIT_XREF_DOMAIN_VALUE RESUME;
+ALTER TASK TASK_XREF_DOMAIN_DELETE RESUME;
+```
+
+---
+
+# 2️⃣ Trigger the tasks by changing data
+
+## A. INSERT (triggers VALIDATION + AUDIT tasks)
+
+```sql
+INSERT INTO DDM_XREF_DOMAIN_VALUE
+(
+  TargetEntity,
+  TargetDomain,
+  TargetDomainValue,
+  FromEntity,
+  FromDomain,
+  FromDomainValue,
+  Description,
+  DSMNumber,
+  CADIS_SYSTEM_INSERTED,
+  CADIS_SYSTEM_UPDATED,
+  CADIS_SYSTEM_CHANGEDBY
+)
+VALUES
+(
+  'ENT_TEST',
+  'DOM_TEST',
+  'VAL_TEST',
+  'ENT_SRC',
+  'DOM_SRC',
+  'VAL_SRC',
+  'Insert test',
+  100,
+  CURRENT_TIMESTAMP(),
+  CURRENT_TIMESTAMP(),
+  CURRENT_USER()
+);
+```
+
+✔ This creates stream records
+✔ Tasks wake up automatically
+
+---
+
+## B. UPDATE (triggers VALIDATION + AUDIT tasks)
+
+```sql
+UPDATE DDM_XREF_DOMAIN_VALUE
+SET Description = 'Update test'
+WHERE TargetEntity = 'ENT_TEST'
+  AND TargetDomain = 'DOM_TEST'
+  AND TargetDomainValue = 'VAL_TEST';
+```
+
+✔ Stream captures DELETE + INSERT
+✔ Audit task writes BEFORE + AFTER
+
+---
+
+## C. DELETE (triggers DELETE + AUDIT tasks)
+
+```sql
+DELETE FROM DDM_XREF_DOMAIN_VALUE
+WHERE TargetEntity = 'ENT_TEST'
+  AND TargetDomain = 'DOM_TEST'
+  AND TargetDomainValue = 'VAL_TEST';
+```
+
+✔ Stream captures DELETE
+✔ Delete task updates version history
+✔ Audit task writes BEFORE image
+
+---
+
+# 3️⃣ Check if stream captured changes
+
+```sql
+SELECT
+  METADATA$ACTION,
+  METADATA$ISUPDATE,
+  *
+FROM STR_DDM_XREF_DOMAIN_VALUE;
+```
+
+Expected:
+
+* INSERT → `METADATA$ACTION = 'INSERT'`
+* UPDATE → DELETE + INSERT
+* DELETE → `METADATA$ACTION = 'DELETE'`
+
+⚠️ After tasks consume the stream, this may be empty.
+
+---
+
+# 4️⃣ Check if tasks were triggered
+
+## A. Task execution history (MOST IMPORTANT)
+
+```sql
+SELECT
+  NAME,
+  STATE,
+  QUERY_TEXT,
+  ERROR_MESSAGE,
+  COMPLETED_TIME
+FROM TABLE(
+  INFORMATION_SCHEMA.TASK_HISTORY(
+    TASK_NAME => 'TASK_AUDIT_XREF_DOMAIN_VALUE',
+    RESULT_LIMIT => 10
+  )
+)
+ORDER BY COMPLETED_TIME DESC;
+```
+
+Repeat for other tasks:
+
+```sql
+SELECT *
+FROM TABLE(
+  INFORMATION_SCHEMA.TASK_HISTORY(
+    TASK_NAME => 'TASK_VALIDATE_XREF_DOMAIN_VALUE',
+    RESULT_LIMIT => 10
+  )
+)
+ORDER BY COMPLETED_TIME DESC;
+```
+
+```sql
+SELECT *
+FROM TABLE(
+  INFORMATION_SCHEMA.TASK_HISTORY(
+    TASK_NAME => 'TASK_XREF_DOMAIN_DELETE',
+    RESULT_LIMIT => 10
+  )
+)
+ORDER BY COMPLETED_TIME DESC;
+```
+
+✔ `STATE = SUCCEEDED` → task ran successfully
+❌ `STATE = FAILED` → validation or procedure failed
+
+---
+
+## B. Check audit table (proof of execution)
+
+```sql
+SELECT *
+FROM DDM_XREF_DOMAIN_VALUE_AUDIT
+ORDER BY CADIS_SYSTEM_UPDATED DESC;
+```
+
+Expected:
+
+* INSERT → AFTER record
+* UPDATE → BEFORE + AFTER records
+* DELETE → BEFORE record
+
+---
+
+## C. Check version history update
+
+(Depending on your implementation)
+
+```sql
+SELECT *
+FROM DDM_XREF_DOMAIN_HISTORY
+ORDER BY UPDATED_TIME DESC;
+```
+
+✔ Confirms `spUpdateXREFDomainHistory()` executed
+
+---
+
+# 5️⃣ Check if stream is empty (task consumed data)
+
+```sql
+SELECT COUNT(*) AS remaining_records
+FROM STR_DDM_XREF_DOMAIN_VALUE;
+```
+
+Expected result:
+
+```
+0
+```
+
+---
+
+# 6️⃣ Common troubleshooting commands
+
+### Task not triggering?
+
+```sql
+SHOW TASKS LIKE 'TASK_%XREF%';
+```
+
+### See task errors
+
+```sql
+SELECT *
+FROM TABLE(INFORMATION_SCHEMA.TASK_HISTORY())
+WHERE STATE = 'FAILED'
+ORDER BY COMPLETED_TIME DESC;
+```
+
+### Manually run a task (for testing)
+
+```sql
+EXECUTE TASK TASK_AUDIT_XREF_DOMAIN_VALUE;
+```
+
+---
+
+# 7️⃣ One-page execution summary
+
+```
+INSERT / UPDATE / DELETE
+   ↓
+STREAM captures change
+   ↓
+TASK wakes up
+   ↓
+PROCEDURE runs
+   ↓
+Audit / Validation / History updated
+```
+
+---
+
+# 8️⃣ Final notes (important)
+
+⚠️ Tasks run **asynchronously**
+⚠️ There may be a **few seconds delay**
+⚠️ Streams are **consumed once**
+
