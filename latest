@@ -1,0 +1,440 @@
+import streamlit as st
+import pandas as pd
+import io
+from snowflake.snowpark.context import get_active_session
+
+st.set_page_config(layout="wide")
+st.title("DDM Governance Dashboard")
+
+# ---------------------------------------------------------
+# REFRESH BUTTON
+# ---------------------------------------------------------
+if st.button("🔄 Refresh App", key="refresh"):
+    st.rerun()
+
+session = get_active_session()
+
+# ---------------------------------------------------------
+# TABLE CONFIG
+# ---------------------------------------------------------
+tables = {
+
+"DDM_DOMAIN_VALUE":{
+
+"main":"TEST.PUBLIC.DDM_DOMAIN_VALUE",
+"stage":"TEST.PUBLIC.STG_DDM_DOMAIN_VALUE",
+"error":None,
+"task":"TASK_PROCESS_DOMAIN",
+
+"required":[
+"TARGETENTITY",
+"TARGETDOMAIN",
+"DOMAINVALUE",
+"DESCRIPTION",
+"DSMNUMBER"
+],
+
+"keys":[
+"TARGETENTITY",
+"TARGETDOMAIN",
+"DOMAINVALUE"
+]
+
+},
+
+"DDM_XREF_DOMAIN_VALUE":{
+
+"main":"TEST.PUBLIC.DDM_XREF_DOMAIN_VALUE",
+"stage":"TEST.PUBLIC.STG_DDM_XREF_DOMAIN_VALUE",
+"error":"TEST.PUBLIC.DDM_XREF_DOMAIN_VALUE_ERROR",
+"task":"TASK_PROCESS_XREF_DOMAIN",
+
+"required":[
+"TARGETENTITY",
+"TARGETDOMAIN",
+"TARGETDOMAINVALUE",
+"FROMENTITY",
+"FROMDOMAIN",
+"FROMDOMAINVALUE",
+"DESCRIPTION",
+"DSMNUMBER"
+],
+
+"keys":[
+"TARGETENTITY",
+"TARGETDOMAIN",
+"TARGETDOMAINVALUE",
+"FROMENTITY",
+"FROMDOMAIN",
+"FROMDOMAINVALUE"
+]
+
+}
+
+}
+
+# ---------------------------------------------------------
+# FILE READER
+# ---------------------------------------------------------
+def read_file(uploaded_file, required_cols):
+
+    uploaded_file.seek(0)
+    file_bytes = uploaded_file.read()
+
+    if file_bytes[:2] == b"PK":
+
+        try:
+            df = pd.read_excel(io.BytesIO(file_bytes))
+        except:
+            raise Exception("Excel file cannot be read.")
+
+    else:
+
+        df=None
+
+        for enc in ["utf-8","utf-8-sig","utf-16","latin1"]:
+            try:
+                df=pd.read_csv(
+                    io.BytesIO(file_bytes),
+                    encoding=enc,
+                    sep=None,
+                    engine="python",
+                    on_bad_lines="skip"
+                )
+                break
+            except:
+                continue
+
+        if df is None:
+            raise Exception("Unable to read uploaded file")
+
+    df.columns=df.columns.str.upper()
+
+    missing=[c for c in required_cols if c not in df.columns]
+
+    if missing:
+        raise Exception(f"Missing columns {missing}")
+
+    return df[required_cols]
+
+
+# ---------------------------------------------------------
+# INSERT INTO STAGE
+# ---------------------------------------------------------
+def insert_stage(stage,row):
+
+    cols=", ".join(row.keys())
+
+    values=", ".join(
+        ["NULL" if row[c] is None or row[c]=="" else f"'{row[c]}'" for c in row]
+    )
+
+    sql=f"""
+    INSERT INTO {stage}
+    ({cols})
+    VALUES ({values})
+    """
+
+    session.sql(sql).collect()
+
+
+# ---------------------------------------------------------
+# APPROVAL DASHBOARD
+# ---------------------------------------------------------
+def approval_dashboard(cfg):
+
+    stage=cfg["stage"]
+    main=cfg["main"]
+    keys=cfg["keys"]
+    task=cfg["task"]
+    required=cfg["required"]
+
+    st.subheader("Approval Dashboard")
+
+    df=session.sql(f"SELECT * FROM {stage}").to_pandas()
+
+    if df.empty:
+        st.success("No pending records")
+        return
+
+    def detect_action(row):
+
+        non_keys=[row[c] for c in required if c not in keys]
+
+        if all(pd.isna(x) or str(x).strip()=="" for x in non_keys):
+            return "DELETE"
+
+        return "INSERT / UPDATE"
+
+    df["ACTION"]=df.apply(detect_action,axis=1)
+    df["Approve"]=False
+
+    select_all=st.checkbox(
+    "Select All Pending Records",
+    key=f"select_all_{stage}"
+    )
+
+    if select_all:
+        df["Approve"]=True
+
+    edited=st.data_editor(
+        df,
+        use_container_width=True,
+        key=f"approval_editor_{stage}"
+    )
+
+    col1,col2=st.columns(2)
+
+    approve=False
+
+    if col1.button("Approve Selected",key=f"approve_sel_{stage}"):
+        approve=True
+
+    if col2.button("Approve All",key=f"approve_all_{stage}"):
+
+        edited["Approve"]=True
+        approve=True
+
+    if approve:
+
+        rows=edited[edited["Approve"]==True]
+
+        if rows.empty:
+            st.warning("No rows selected")
+            return
+
+        session.sql(f"EXECUTE TASK {task}").collect()
+
+        success=0
+        fail=0
+
+        for _,r in rows.iterrows():
+
+            cond=" AND ".join([f"{k}='{r[k]}'" for k in keys])
+
+            res=session.sql(
+            f"SELECT COUNT(*) C FROM {main} WHERE {cond}"
+            ).to_pandas()
+
+            count=res.iloc[0]["C"]
+
+            if r["ACTION"]=="DELETE":
+                processed=(count==0)
+            else:
+                processed=(count>0)
+
+            if processed:
+
+                session.sql(
+                f"DELETE FROM {stage} WHERE {cond}"
+                ).collect()
+
+                success+=1
+
+            else:
+                fail+=1
+
+        st.success(f"{success} records processed")
+
+        if fail>0:
+            st.error(f"{fail} records failed validation")
+
+        st.rerun()
+
+
+# ---------------------------------------------------------
+# MAIN TABLE EDIT
+# ---------------------------------------------------------
+def main_table(cfg):
+
+    main=cfg["main"]
+    stage=cfg["stage"]
+
+    st.subheader("Main Table")
+
+    df=session.sql(f"SELECT * FROM {main}").to_pandas()
+
+    edit=st.checkbox("Enable Edit",key=f"edit_checkbox_{main}")
+
+    edited=st.data_editor(
+        df,
+        disabled=not edit,
+        use_container_width=True,
+        key=f"editor_{main}"
+    )
+
+    if edit:
+
+        if st.button("Send Edits to Approval",key=f"send_edit_{stage}"):
+
+            changed=[]
+
+            for i in range(len(df)):
+                if not df.iloc[i].equals(edited.iloc[i]):
+                    changed.append(edited.iloc[i])
+
+            if not changed:
+                st.info("No changes detected")
+                return
+
+            for r in changed:
+                insert_stage(stage,r.to_dict())
+
+            st.success(f"{len(changed)} rows sent to approval")
+            st.rerun()
+
+
+# ---------------------------------------------------------
+# MANUAL INSERT
+# ---------------------------------------------------------
+def manual_insert(cfg):
+
+    stage=cfg["stage"]
+    required=cfg["required"]
+
+    st.subheader("Manual Insert")
+
+    inputs={}
+
+    for c in required:
+        inputs[c]=st.text_input(c,key=f"insert_{stage}_{c}")
+
+    if st.button("Insert Record",key=f"insert_btn_{stage}"):
+
+        missing=[c for c in required if not inputs[c]]
+
+        if missing:
+            st.error(f"Missing fields {missing}")
+            return
+
+        insert_stage(stage,inputs)
+
+        st.success("Record sent for approval")
+        st.rerun()
+
+
+# ---------------------------------------------------------
+# DELETE BLOCK
+# ---------------------------------------------------------
+def delete_block(cfg):
+
+    stage=cfg["stage"]
+    required=cfg["required"]
+    keys=cfg["keys"]
+
+    st.subheader("Delete Record")
+
+    inputs={}
+
+    for c in keys:
+        inputs[c]=st.text_input(f"{c} (Key)",key=f"delete_{stage}_{c}")
+
+    confirm=st.checkbox("Confirm Delete",key=f"confirm_delete_{stage}")
+
+    if st.button("Send Delete Request",key=f"delete_btn_{stage}"):
+
+        if not confirm:
+            st.warning("Please confirm delete")
+            return
+
+        row={c:None for c in required}
+
+        for k in keys:
+            row[k]=inputs[k]
+
+        insert_stage(stage,row)
+
+        st.success("Delete request sent")
+        st.rerun()
+
+
+# ---------------------------------------------------------
+# FILE UPLOAD
+# ---------------------------------------------------------
+def upload_block(cfg):
+
+    stage=cfg["stage"]
+    required=cfg["required"]
+
+    st.subheader("Upload CSV or Excel")
+
+    uploaded=st.file_uploader(
+        "Upload File",
+        type=["csv","xlsx"],
+        key=f"upload_{stage}"
+    )
+
+    if uploaded:
+
+        try:
+
+            df=read_file(uploaded,required)
+
+            st.success(f"{len(df)} valid rows detected")
+            st.dataframe(df)
+
+            if st.button("Upload Data",key=f"upload_btn_{stage}"):
+
+                for _,row in df.iterrows():
+                    insert_stage(stage,row.to_dict())
+
+                st.success("Upload completed successfully")
+                st.rerun()
+
+        except Exception as e:
+            st.error(str(e))
+
+
+# ---------------------------------------------------------
+# INVALID DASHBOARD
+# ---------------------------------------------------------
+def invalid_dashboard(cfg):
+
+    err=cfg["error"]
+
+    if err is None:
+        return
+
+    st.subheader("Invalid Records")
+
+    try:
+        df=session.sql(f"SELECT * FROM {err}").to_pandas()
+    except:
+        df=pd.DataFrame()
+
+    if df.empty:
+        st.success("No invalid records")
+    else:
+        st.error("Records failed validation")
+        st.dataframe(df)
+
+
+# ---------------------------------------------------------
+# UI
+# ---------------------------------------------------------
+tab1,tab2=st.tabs([
+"DDM_DOMAIN_VALUE",
+"DDM_XREF_DOMAIN_VALUE"
+])
+
+with tab1:
+
+    cfg=tables["DDM_DOMAIN_VALUE"]
+
+    approval_dashboard(cfg)
+    main_table(cfg)
+    manual_insert(cfg)
+    delete_block(cfg)
+    upload_block(cfg)
+    invalid_dashboard(cfg)
+
+with tab2:
+
+    cfg=tables["DDM_XREF_DOMAIN_VALUE"]
+
+    approval_dashboard(cfg)
+    main_table(cfg)
+    manual_insert(cfg)
+    delete_block(cfg)
+    upload_block(cfg)
+    invalid_dashboard(cfg)
